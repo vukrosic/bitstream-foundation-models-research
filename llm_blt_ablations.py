@@ -210,7 +210,7 @@ def load_and_cache_data(config: ModelConfig, cache_dir: str = "data_cache"):
 
 class BytePatchDataset(Dataset):
     """Dataset that works with byte patches for BLT"""
-    def __init__(self, texts: List[str], patcher: FixedSizePatcher, seq_len: int = 128):
+    def __init__(self, texts: List[str], patcher, seq_len: int = 128):
         self.texts = texts
         self.patcher = patcher
         self.seq_len = seq_len  # sequence length in patches
