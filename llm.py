@@ -141,6 +141,22 @@ def load_patches_data():
     
     return patches
 
+def collate_batch(batch):
+    """Custom collate function to handle variable boundaries"""
+    bytes_list = [item['bytes'] for item in batch]
+    targets_list = [item['targets'] for item in batch]
+    boundaries_list = [item['boundaries'] for item in batch]
+    
+    # Stack tensors (they should all be same size due to padding)
+    bytes_batch = torch.stack(bytes_list)
+    targets_batch = torch.stack(targets_list)
+    
+    return {
+        'bytes': bytes_batch,
+        'targets': targets_batch,
+        'boundaries': boundaries_list  # Keep as list
+    }
+
 class PatchDataset(Dataset):
     def __init__(self, patches: List[List[int]], max_patches: int = 15):
         self.patches = patches
@@ -189,8 +205,7 @@ class PatchDataset(Dataset):
         return {
             'bytes': torch.tensor(all_bytes, dtype=torch.long),
             'targets': torch.tensor(targets, dtype=torch.long),
-            'boundaries': boundaries,
-            'patch_count': len(boundaries)
+            'boundaries': boundaries
         }
 
 class Rotary(nn.Module):
@@ -738,8 +753,8 @@ if __name__ == "__main__":
         dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, collate_fn=collate_batch)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
 
     print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
