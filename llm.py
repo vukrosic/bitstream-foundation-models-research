@@ -142,19 +142,23 @@ def load_patches_data():
     return patches
 
 def collate_batch(batch):
-    """Custom collate function to handle variable boundaries"""
+    """Custom collate function to handle boundaries as tensors"""
     bytes_list = [item['bytes'] for item in batch]
     targets_list = [item['targets'] for item in batch]
     boundaries_list = [item['boundaries'] for item in batch]
+    valid_patches_list = [item['valid_patches'] for item in batch]
     
-    # Stack tensors (they should all be same size due to padding)
+    # Stack all tensors
     bytes_batch = torch.stack(bytes_list)
     targets_batch = torch.stack(targets_list)
+    boundaries_batch = torch.stack(boundaries_list)
+    valid_patches_batch = torch.stack(valid_patches_list)
     
     return {
         'bytes': bytes_batch,
         'targets': targets_batch,
-        'boundaries': boundaries_list  # Keep as list
+        'boundaries': boundaries_batch,
+        'valid_patches': valid_patches_batch
     }
 
 class PatchDataset(Dataset):
@@ -199,13 +203,22 @@ class PatchDataset(Dataset):
             # Pad with zeros
             all_bytes.extend([0] * (max_bytes - len(all_bytes)))
         
+        # Convert boundaries to tensor format
+        boundary_tensor = torch.zeros(self.max_patches, 2, dtype=torch.long)
+        valid_patches = torch.zeros(self.max_patches, dtype=torch.bool)
+        
+        for i, (start, end) in enumerate(boundaries[:self.max_patches]):
+            boundary_tensor[i] = torch.tensor([start, end])
+            valid_patches[i] = True
+        
         # Create targets (next byte prediction)
         targets = all_bytes[1:] + [0]  # Shift by 1
         
         return {
             'bytes': torch.tensor(all_bytes, dtype=torch.long),
             'targets': torch.tensor(targets, dtype=torch.long),
-            'boundaries': boundaries
+            'boundaries': boundary_tensor,
+            'valid_patches': valid_patches
         }
 
 class Rotary(nn.Module):
@@ -280,6 +293,20 @@ class TransformerBlock(nn.Module):
         x = x + self.dropout(ff_out)
         return x
 
+@torch.compile
+def create_patch_mask(boundaries: torch.Tensor, valid_patches: torch.Tensor, max_bytes: int):
+    """Create attention masks from boundary tensors"""
+    batch_size, max_patches, _ = boundaries.shape
+    mask = torch.zeros(batch_size, max_patches, max_bytes, device=boundaries.device)
+    
+    for b in range(batch_size):
+        for p in range(max_patches):
+            if valid_patches[b, p]:
+                start, end = boundaries[b, p]
+                if start < end and end <= max_bytes:
+                    mask[b, p, start:end] = 1
+    return mask
+
 class LocalEncoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -291,7 +318,7 @@ class LocalEncoder(nn.Module):
         # Small transformer for processing bytes
         self.byte_transformer = TransformerBlock(
             config.h_encoder, 
-            config.h_encoder // 64,  # Fewer heads for smaller model
+            max(1, config.h_encoder // 64),  # At least 1 head
             config.h_encoder * 2, 
             100,  # Max bytes
             config.dropout
@@ -300,68 +327,66 @@ class LocalEncoder(nn.Module):
         # Cross-attention to pool bytes into patch vectors
         self.cross_attn = nn.MultiheadAttention(
             config.h_encoder, 
-            num_heads=config.h_encoder // 64, 
+            num_heads=max(1, config.h_encoder // 64), 
             batch_first=True
         )
         
         # Project to main model dimension
         self.patch_proj = nn.Linear(config.h_encoder, config.d_model)
         
-    def forward(self, bytes_tensor, boundaries, first_call=False):
-        batch_size = bytes_tensor.size(0)
+    def forward(self, bytes_tensor, boundaries, valid_patches, first_call=False):
+        batch_size, max_bytes = bytes_tensor.shape
+        max_patches = boundaries.size(1)
         
         if first_call:
             print(f"🔧 Encoder input: bytes shape {bytes_tensor.shape}")
-            print(f"   First few bytes: {bytes_tensor[0, :10].tolist()}")
-            print(f"   Boundaries: {boundaries[0][:3]}...")
+            print(f"   Boundaries shape: {boundaries.shape}")
+            print(f"   Valid patches: {valid_patches.sum().item()}")
         
-        # 1. Embed bytes
-        byte_embeds = self.byte_embed(bytes_tensor)  # [batch, max_bytes, h_encoder]
-        
-        # 2. Process with small transformer
+        # 1. Embed and transform bytes
+        byte_embeds = self.byte_embed(bytes_tensor)
         byte_hidden = self.byte_transformer(byte_embeds)
         
-        if first_call:
-            print(f"   Byte embeddings shape: {byte_embeds.shape}")
-            print(f"   After transformer: {byte_hidden.shape}")
+        # 2. Create attention mask for all patches at once
+        attn_mask = create_patch_mask(boundaries, valid_patches, max_bytes)
         
-        # 3. Pool bytes into patches via cross-attention
-        patch_vecs = []
+        # 3. Create queries by masked pooling
+        queries = torch.zeros(batch_size, max_patches, self.config.h_encoder, device=bytes_tensor.device)
+        
         for b in range(batch_size):
-            batch_patches = []
-            for start, end in boundaries[b]:
-                if start < end and end <= byte_hidden.size(1):
-                    # Get bytes for this patch
-                    patch_bytes = byte_hidden[b:b+1, start:end]  # [1, patch_len, h_encoder]
-                    
-                    # Query: mean-pooled patch representation
-                    query = patch_bytes.mean(dim=1, keepdim=True)  # [1, 1, h_encoder]
-                    
-                    # Cross-attention: query attends to patch bytes
-                    patch_vec, _ = self.cross_attn(
-                        query=query,
-                        key=patch_bytes,
-                        value=patch_bytes
-                    )
-                    batch_patches.append(patch_vec.squeeze(1))  # [1, h_encoder]
-            
-            if batch_patches:
-                batch_patch_tensor = torch.cat(batch_patches, dim=0)  # [n_patches, h_encoder]
-                patch_vecs.append(batch_patch_tensor)
+            for p in range(max_patches):
+                if valid_patches[b, p]:
+                    start, end = boundaries[b, p]
+                    if start < end and end <= max_bytes:
+                        queries[b, p] = byte_hidden[b, start:end].mean(dim=0)
         
-        # Pad to same length
-        max_patches = max(len(pv) for pv in patch_vecs)
-        padded_patches = []
-        for pv in patch_vecs:
-            if len(pv) < max_patches:
-                padding = torch.zeros(max_patches - len(pv), self.config.h_encoder, device=pv.device)
-                pv = torch.cat([pv, padding], dim=0)
-            padded_patches.append(pv)
+        # 4. Batched cross-attention
+        # Reshape for batched processing
+        queries_flat = queries.view(-1, 1, self.config.h_encoder)  # [batch*max_patches, 1, h_encoder]
         
-        patch_tensor = torch.stack(padded_patches, dim=0)  # [batch, max_patches, h_encoder]
+        # Expand byte_hidden for each patch
+        byte_hidden_expanded = byte_hidden.unsqueeze(1).expand(-1, max_patches, -1, -1)
+        keys_flat = byte_hidden_expanded.reshape(-1, max_bytes, self.config.h_encoder)
+        values_flat = keys_flat
         
-        # 4. Project to main model dimension
-        patch_vecs_projected = self.patch_proj(patch_tensor)  # [batch, max_patches, d_model]
+        # Create attention mask
+        attn_mask_flat = attn_mask.view(-1, 1, max_bytes)
+        attn_mask_flat = attn_mask_flat.masked_fill(attn_mask_flat == 0, float('-inf'))
+        attn_mask_flat = attn_mask_flat.masked_fill(attn_mask_flat == 1, 0.0)
+        
+        # Single cross-attention call
+        patch_vecs, _ = self.cross_attn(
+            query=queries_flat,
+            key=keys_flat,
+            value=values_flat,
+            attn_mask=attn_mask_flat
+        )
+        
+        # Reshape back
+        patch_vecs = patch_vecs.view(batch_size, max_patches, self.config.h_encoder)
+        
+        # 5. Project to main model dimension
+        patch_vecs_projected = self.patch_proj(patch_vecs)
         
         if first_call:
             print(f"   Patch vectors shape: {patch_vecs_projected.shape}")
@@ -378,7 +403,7 @@ class LocalDecoder(nn.Module):
         self.cross_attn_layers = nn.ModuleList([
             nn.MultiheadAttention(
                 config.h_decoder, 
-                num_heads=config.h_decoder // 64, 
+                num_heads=max(1, config.h_decoder // 64), 
                 batch_first=True
             )
             for _ in range(config.n_decoder_layers)
@@ -388,7 +413,7 @@ class LocalDecoder(nn.Module):
         self.byte_transformer_layers = nn.ModuleList([
             TransformerBlock(
                 config.h_decoder, 
-                config.h_decoder // 64,
+                max(1, config.h_decoder // 64),
                 config.h_decoder * 2, 
                 100,
                 config.dropout
@@ -399,69 +424,60 @@ class LocalDecoder(nn.Module):
         # Project patch vectors to decoder dimension
         self.patch_proj = nn.Linear(config.d_model, config.h_decoder)
         
+        # Project encoder hidden if needed
+        self.byte_proj = nn.Linear(config.h_encoder, config.h_decoder)
+        
         # Output projection to byte vocabulary
         self.output_proj = nn.Linear(config.h_decoder, config.vocab_size)
         
-    def forward(self, patch_vecs, byte_hidden_from_encoder, boundaries, first_call=False):
+    def forward(self, patch_vecs, byte_hidden_from_encoder, boundaries, valid_patches, first_call=False):
         batch_size = patch_vecs.size(0)
+        max_bytes = byte_hidden_from_encoder.size(1)
+        max_patches = boundaries.size(1)
         
         if first_call:
             print(f"🔧 Decoder input: patch_vecs shape {patch_vecs.shape}")
             print(f"   Byte hidden shape: {byte_hidden_from_encoder.shape}")
         
-        # Project patch vectors to decoder dimension
-        patch_vecs_dec = self.patch_proj(patch_vecs)  # [batch, max_patches, h_decoder]
+        # Project patch vectors and byte hidden to decoder dimension
+        patch_vecs_dec = self.patch_proj(patch_vecs)
+        byte_reprs = self.byte_proj(byte_hidden_from_encoder)
         
-        # Start with encoder's byte representations (project to decoder dim)
-        if byte_hidden_from_encoder.size(-1) != self.config.h_decoder:
-            # Need projection if dimensions don't match
-            proj = nn.Linear(byte_hidden_from_encoder.size(-1), self.config.h_decoder).to(byte_hidden_from_encoder.device)
-            byte_reprs = proj(byte_hidden_from_encoder)
-        else:
-            byte_reprs = byte_hidden_from_encoder
+        # Create byte-to-patch mapping
+        byte_to_patch = torch.zeros(batch_size, max_bytes, dtype=torch.long, device=patch_vecs.device)
+        
+        for b in range(batch_size):
+            for p in range(max_patches):
+                if valid_patches[b, p]:
+                    start, end = boundaries[b, p]
+                    if start < end and end <= max_bytes:
+                        byte_to_patch[b, start:end] = p
         
         # Apply decoder layers
         for i, (cross_attn, transformer) in enumerate(zip(self.cross_attn_layers, self.byte_transformer_layers)):
-            # 1. Cross-attention: bytes query their patch vectors
-            new_byte_reprs = []
-            for b in range(batch_size):
-                batch_bytes = []
-                for j, (start, end) in enumerate(boundaries[b]):
-                    if start < end and end <= byte_reprs.size(1) and j < patch_vecs_dec.size(1):
-                        # Bytes in this patch query the patch vector
-                        bytes_chunk = byte_reprs[b:b+1, start:end]  # [1, patch_len, h_decoder]
-                        patch_vec = patch_vecs_dec[b:b+1, j:j+1]  # [1, 1, h_decoder]
-                        
-                        # Expand patch vector for K/V
-                        patch_vec_expanded = patch_vec.expand(-1, bytes_chunk.size(1), -1)
-                        
-                        # Cross-attention
-                        enhanced_bytes, _ = cross_attn(
-                            query=bytes_chunk,
-                            key=patch_vec_expanded,
-                            value=patch_vec_expanded
-                        )
-                        batch_bytes.append(enhanced_bytes)
-                
-                if batch_bytes:
-                    batch_tensor = torch.cat(batch_bytes, dim=1)  # [1, total_bytes, h_decoder]
-                    # Pad to original length
-                    if batch_tensor.size(1) < byte_reprs.size(1):
-                        padding = torch.zeros(1, byte_reprs.size(1) - batch_tensor.size(1), self.config.h_decoder, device=batch_tensor.device)
-                        batch_tensor = torch.cat([batch_tensor, padding], dim=1)
-                    new_byte_reprs.append(batch_tensor)
+            # Get patch vectors for each byte position
+            patch_vecs_for_bytes = torch.gather(
+                patch_vecs_dec, 
+                dim=1, 
+                index=byte_to_patch.unsqueeze(-1).expand(-1, -1, self.config.h_decoder)
+            )
             
-            if new_byte_reprs:
-                byte_reprs = torch.cat(new_byte_reprs, dim=0)
+            # Batched cross-attention
+            enhanced_bytes, _ = cross_attn(
+                query=byte_reprs,
+                key=patch_vecs_for_bytes,
+                value=patch_vecs_for_bytes
+            )
             
-            # 2. Transformer on bytes
+            # Residual connection and transformer
+            byte_reprs = enhanced_bytes + byte_reprs
             byte_reprs = transformer(byte_reprs)
             
             if first_call and i == 0:
                 print(f"   After decoder layer {i}: {byte_reprs.shape}")
         
-        # 3. Project to byte vocabulary
-        logits = self.output_proj(byte_reprs)  # [batch, max_bytes, 256]
+        # Project to byte vocabulary
+        logits = self.output_proj(byte_reprs)
         
         if first_call:
             print(f"   Final logits shape: {logits.shape}")
@@ -500,12 +516,12 @@ class BLT_LLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, bytes_tensor, boundaries, first_call=False):
+    def forward(self, bytes_tensor, boundaries, valid_patches, first_call=False):
         if first_call:
             print(f"🚀 BLT Forward pass:")
         
         # 1. Encoder: bytes -> patch vectors
-        patch_vecs, byte_hidden = self.encoder(bytes_tensor, boundaries, first_call)
+        patch_vecs, byte_hidden = self.encoder(bytes_tensor, boundaries, valid_patches, first_call)
         
         if first_call:
             print(f"   Encoded to {patch_vecs.shape[1]} patch vectors")
@@ -526,7 +542,7 @@ class BLT_LLM(nn.Module):
             print(f"   LLM output: {x.shape}")
         
         # 3. Decoder: patch vectors -> byte predictions
-        logits = self.decoder(x, byte_hidden, boundaries, first_call)
+        logits = self.decoder(x, byte_hidden, boundaries, valid_patches, first_call)
         
         return logits
 
@@ -546,10 +562,11 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
             
             bytes_tensor = batch['bytes'].to(device)
             targets = batch['targets'].to(device)
-            boundaries = batch['boundaries']
+            boundaries = batch['boundaries'].to(device)
+            valid_patches = batch['valid_patches'].to(device)
 
             with autocast(enabled=config.use_amp):
-                logits = model(bytes_tensor, boundaries)
+                logits = model(bytes_tensor, boundaries, valid_patches)
                 loss = F.cross_entropy(logits.view(-1, config.vocab_size), targets.view(-1))
 
             total_loss += loss.item() * targets.numel()
@@ -642,17 +659,18 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
             bytes_tensor = batch['bytes'].to(device)
             targets = batch['targets'].to(device)
-            boundaries = batch['boundaries']
+            boundaries = batch['boundaries'].to(device)
+            valid_patches = batch['valid_patches'].to(device)
 
             # Forward pass with gradient accumulation
             if config.use_amp:
                 with autocast():
-                    logits = model(bytes_tensor, boundaries, first_call=first_batch)
+                    logits = model(bytes_tensor, boundaries, valid_patches, first_call=first_batch)
                     loss = F.cross_entropy(logits.view(-1, config.vocab_size), targets.view(-1))
                     loss = loss / config.gradient_accumulation_steps
                 scaler.scale(loss).backward()
             else:
-                logits = model(bytes_tensor, boundaries, first_call=first_batch)
+                logits = model(bytes_tensor, boundaries, valid_patches, first_call=first_batch)
                 loss = F.cross_entropy(logits.view(-1, config.vocab_size), targets.view(-1))
                 loss = loss / config.gradient_accumulation_steps
                 loss.backward()
@@ -753,8 +771,22 @@ if __name__ == "__main__":
         dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
     )
 
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0, collate_fn=collate_batch)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0, collate_fn=collate_batch)
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=config.batch_size * 2,  # Increase batch size
+        shuffle=True, 
+        num_workers=2,  # Use multiple workers
+        pin_memory=True,  # Pin memory for faster GPU transfer
+        collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=config.batch_size * 2, 
+        shuffle=False, 
+        num_workers=2, 
+        pin_memory=True,
+        collate_fn=collate_batch
+    )
 
     print(f"📊 Dataset: {len(train_dataset)} train, {len(val_dataset)} val samples")
 
