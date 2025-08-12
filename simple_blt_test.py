@@ -23,14 +23,14 @@ def set_seed(seed: int = 42):
 @dataclass
 class SimpleConfig:
     # Small model for testing
-    d_model: int = 128
-    n_heads: int = 4
+    d_model: int = 128  # Must be divisible by n_heads
+    n_heads: int = 4    # 128 / 4 = 32 (d_k)
     n_layers: int = 2
     d_ff: int = 512
     max_steps: int = 200
     
     # Local models (even smaller)
-    local_d_model: int = 64
+    local_d_model: int = 64  # Must be divisible by local n_heads (2)
     local_n_layers: int = 1
     patch_size: int = 4
     max_patch_len: int = 8
@@ -43,23 +43,35 @@ class SimpleConfig:
     # Data
     vocab_size: int = 258
     dropout: float = 0.1
+    
+    def __post_init__(self):
+        assert self.d_model % self.n_heads == 0, f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
+        assert self.local_d_model % 2 == 0, f"local_d_model ({self.local_d_model}) must be divisible by 2 (for local attention)"
 
 class SimpleRotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
-        angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
+        # Create rotary frequencies
+        angular_freq = (1 / 10000) ** torch.linspace(0, 1, steps=dim//2, dtype=torch.float32)
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
         self.register_buffer('cos', theta.cos(), persistent=False)
         self.register_buffer('sin', theta.sin(), persistent=False)
 
     def forward(self, x):
-        cos, sin = self.cos[None, :x.size(-3), None, :], self.sin[None, :x.size(-3), None, :]
-        x1, x2 = x.to(dtype=torch.float32).chunk(2, dim=-1)
-        y1 = x1 * cos + x2 * sin
-        y2 = x1 * (-sin) + x2 * cos
-        return torch.cat((y1, y2), 3).type_as(x)
+        # x shape: (batch_size, n_heads, seq_len, d_k)
+        seq_len = x.size(-2)
+        cos = self.cos[:seq_len, :].unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k//2)
+        sin = self.sin[:seq_len, :].unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, d_k//2)
+        
+        # Split x into two halves
+        x1, x2 = x.chunk(2, dim=-1)
+        
+        # Apply rotation
+        y1 = x1 * cos - x2 * sin
+        y2 = x1 * sin + x2 * cos
+        
+        return torch.cat((y1, y2), dim=-1).type_as(x)
 
 class SimpleAttention(nn.Module):
     def __init__(self, d_model: int, n_heads: int, max_seq_len: int):
@@ -67,19 +79,32 @@ class SimpleAttention(nn.Module):
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_k = d_model // n_heads
+        assert d_model % n_heads == 0, f"d_model ({d_model}) must be divisible by n_heads ({n_heads})"
+        
         self.qkv = nn.Linear(d_model, d_model * 3, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.rotary = SimpleRotary(self.d_k, max_seq_len)
 
     def forward(self, x):
-        batch_size, seq_len = x.size(0), x.size(1)
-        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
+        batch_size, seq_len, d_model = x.shape
+        
+        # Project to Q, K, V
+        qkv = self.qkv(x)  # (batch_size, seq_len, d_model * 3)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.n_heads, self.d_k)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch_size, n_heads, seq_len, d_k)
         Q, K, V = qkv[0], qkv[1], qkv[2]
+        
+        # Apply rotary embeddings
         Q = self.rotary(Q)
         K = self.rotary(K)
+        
+        # Attention
         attn_output = F.scaled_dot_product_attention(Q, K, V, is_causal=True)
-        attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
+        
+        # Reshape back
+        attn_output = attn_output.transpose(1, 2).contiguous()  # (batch_size, seq_len, n_heads, d_k)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.d_model)
+        
         return self.w_o(attn_output)
 
 class SimpleFeedForward(nn.Module):
