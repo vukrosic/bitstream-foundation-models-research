@@ -61,7 +61,7 @@ def load_model_and_create_patches():
         print(f"❌ Model file {model_path} not found. Please train the model first.")
         return
     
-    checkpoint = torch.load(model_path, map_location='cpu')
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
     
     # Initialize model
