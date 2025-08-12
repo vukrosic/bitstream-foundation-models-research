@@ -1,436 +1,297 @@
-#!/usr/bin/env python3
-"""
-Complete BLT Training Pipeline
-
-This script implements the full BLT training approach:
-1. Train entropy model (or load existing)
-2. Use entropy model to create patches
-3. Train BLT model end-to-end on patched data
-
-Usage:
-    python train_blt.py [--entropy_model_path entropy_model.pth]
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-import argparse
-import os
+from torch.cuda.amp import autocast, GradScaler
+import math
 import time
-from typing import List, Tuple, Dict, Any
 from tqdm import tqdm
+from dataclasses import dataclass
+import numpy as np
 
-# Import modules
-from entropy_llm import MinimalLLM, ModelConfig as EntropyConfig, load_and_cache_data, set_seed
+from blt_model import BLTModel, BLTConfig
 from entropy_patcher import EntropyPatcher
-from blt_model import BLTModel, BLTConfig, train_blt
-from save_entropy_model import load_entropy_model
+from train_entropy_model import EntropyModel, EntropyModelConfig
+
+@dataclass 
+class TrainingConfig:
+    # Model scale
+    model_size: str = "small"  # small, medium, large
+    
+    # Training
+    batch_size: int = 16
+    learning_rate: float = 3e-4
+    max_steps: int = 10000
+    warmup_steps: int = 1000
+    gradient_accumulation: int = 4
+    
+    # Data
+    max_seq_len: int = 2048  # in bytes
+    num_documents: int = 5000
+    
+    # Patching
+    target_patch_size: float = 6.0
+    patching_method: str = "global"
+    
+    # Evaluation
+    eval_every: int = 500
+    save_every: int = 1000
+
+def get_model_config(size="small"):
+    """Get BLT config for different model sizes"""
+    if size == "small":
+        return BLTConfig(
+            encoder_layers=1,
+            encoder_dim=512,
+            global_layers=12,
+            global_dim=1024,
+            global_heads=8,
+            decoder_layers=6,
+            decoder_dim=512,
+            k_factor=2
+        )
+    elif size == "medium":
+        return BLTConfig(
+            encoder_layers=1,
+            encoder_dim=768,
+            global_layers=24,
+            global_dim=1536,
+            global_heads=12,
+            decoder_layers=9,
+            decoder_dim=768,
+            k_factor=2
+        )
+    else:  # large
+        return BLTConfig(
+            encoder_layers=3,
+            encoder_dim=1024,
+            global_layers=32,
+            global_dim=4096,
+            global_heads=32,
+            decoder_layers=9,
+            decoder_dim=1024,
+            k_factor=4
+        )
 
 class BLTDataset(Dataset):
-    """Dataset for BLT training with patches"""
-    
-    def __init__(self, texts: List[str], entropy_patcher: EntropyPatcher, max_seq_len: int = 512):
-        self.texts = texts
-        self.patcher = entropy_patcher
+    """Dataset for BLT training with pre-computed patches"""
+    def __init__(self, byte_sequences, patcher, max_seq_len=2048):
+        self.byte_sequences = byte_sequences
+        self.patcher = patcher
         self.max_seq_len = max_seq_len
         
-        # Pre-process all texts into byte sequences and patches
+        # Pre-compute patches for all sequences
+        print("Pre-computing patches...")
         self.data = []
-        print("🔄 Pre-processing texts into patches...")
-        
-        for text in tqdm(texts, desc="Processing texts"):
-            # Convert to bytes
-            byte_sequence = list(text.encode('utf-8'))
-            
-            # Limit length
-            if len(byte_sequence) > max_seq_len:
-                byte_sequence = byte_sequence[:max_seq_len]
-            
-            if len(byte_sequence) < 10:  # Skip very short sequences
-                continue
-            
-            # Create patches
-            patches = self.patcher.create_patches(byte_sequence)
-            
-            if not patches:  # Skip if no patches created
-                continue
-            
-            # Create patch boundaries
-            boundaries = []
-            current_pos = 0
-            for patch in patches:
-                start = current_pos
-                end = current_pos + len(patch)
-                boundaries.append((start, end))
-                current_pos = end
-            
-            # Reconstruct full sequence from patches (should match original)
-            reconstructed = []
-            for patch in patches:
-                reconstructed.extend(patch)
-            
-            # Pad if necessary
-            if len(reconstructed) < max_seq_len:
-                reconstructed.extend([0] * (max_seq_len - len(reconstructed)))
+        for seq in tqdm(byte_sequences, desc="Creating patches"):
+            if len(seq) > max_seq_len:
+                # Split long sequences
+                for i in range(0, len(seq) - max_seq_len, max_seq_len // 2):
+                    chunk = seq[i:i + max_seq_len]
+                    boundaries = patcher.create_boundaries(chunk)
+                    self.data.append((chunk, boundaries))
             else:
-                reconstructed = reconstructed[:max_seq_len]
-            
-            self.data.append({
-                'bytes': reconstructed,
-                'boundaries': boundaries,
-                'original_length': len(byte_sequence)
-            })
-        
-        print(f"✅ Processed {len(self.data)} sequences with patches")
+                boundaries = patcher.create_boundaries(seq)
+                self.data.append((seq, boundaries))
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        item = self.data[idx]
+        bytes_seq, boundaries = self.data[idx]
         
-        bytes_tensor = torch.tensor(item['bytes'], dtype=torch.long)
+        # Pad to max_seq_len
+        if len(bytes_seq) < self.max_seq_len:
+            pad_len = self.max_seq_len - len(bytes_seq)
+            bytes_seq = bytes_seq + [0] * pad_len
+            boundaries = np.concatenate([boundaries, np.zeros(pad_len)])
         
-        # Create input (bytes[:-1]) and target (bytes[1:])
-        input_bytes = bytes_tensor[:-1]
-        target_bytes = bytes_tensor[1:]
+        # Convert to tensors
+        x = torch.tensor(bytes_seq[:-1], dtype=torch.long)
+        y = torch.tensor(bytes_seq[1:], dtype=torch.long)
+        boundaries = torch.tensor(boundaries[:-1], dtype=torch.long)
         
-        # Adjust boundaries for input sequence
-        boundaries = [(max(0, start-1), max(0, end-1)) for start, end in item['boundaries']]
-        boundaries = [(s, e) for s, e in boundaries if s < len(input_bytes) and e <= len(input_bytes)]
-        
-        return {
-            'bytes': input_bytes,
-            'target_bytes': target_bytes,
-            'boundaries': boundaries
-        }
+        return x, y, boundaries
 
-def collate_blt_batch(batch):
-    """Custom collate function for BLT batches"""
-    bytes_batch = torch.stack([item['bytes'] for item in batch])
-    target_batch = torch.stack([item['target_bytes'] for item in batch])
-    boundaries_batch = [item['boundaries'] for item in batch]
+def train_blt(config: TrainingConfig):
+    """Main training function"""
+    print("🚀 Starting BLT Training")
     
-    return {
-        'bytes': bytes_batch,
-        'target_bytes': target_batch,
-        'patch_boundaries': boundaries_batch
-    }
-
-def setup_blt_optimizer(model: BLTModel, lr: float = 1e-4):
-    """Setup optimizer for BLT model"""
-    # Different learning rates for different components
-    encoder_params = list(model.local_encoder.parameters())
-    global_params = list(model.global_transformer.parameters())
-    decoder_params = list(model.local_decoder.parameters())
+    # Load entropy model
+    print("Loading entropy model...")
+    entropy_config = EntropyModelConfig()
+    entropy_model = EntropyModel(entropy_config)
+    entropy_model.load_state_dict(torch.load('entropy_model.pt'))
+    entropy_model.eval()
     
-    optimizer = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': lr * 0.5},  # Encoder gets lower LR
-        {'params': global_params, 'lr': lr},         # Global gets base LR
-        {'params': decoder_params, 'lr': lr * 0.5}   # Decoder gets lower LR
-    ], weight_decay=0.01)
-    
-    return optimizer
-
-def evaluate_blt_model(model: BLTModel, val_loader: DataLoader, device: torch.device):
-    """Evaluate BLT model"""
-    model.eval()
-    total_loss = 0
-    total_tokens = 0
-    total_correct = 0
-    
-    with torch.no_grad():
-        for batch in val_loader:
-            bytes_input = batch['bytes'].to(device)
-            target_bytes = batch['target_bytes'].to(device)
-            patch_boundaries = batch['patch_boundaries']
-            
-            try:
-                # Forward pass
-                predictions = model(bytes_input, patch_boundaries)
-                
-                # Compute loss
-                loss = F.cross_entropy(
-                    predictions.view(-1, model.config.vocab_size),
-                    target_bytes.view(-1),
-                    ignore_index=0  # Ignore padding
-                )
-                
-                # Accumulate metrics
-                total_loss += loss.item() * target_bytes.numel()
-                total_tokens += target_bytes.numel()
-                
-                # Accuracy
-                pred_tokens = predictions.argmax(dim=-1)
-                correct = (pred_tokens == target_bytes).sum().item()
-                total_correct += correct
-                
-            except Exception as e:
-                print(f"⚠️ Evaluation batch failed: {e}")
-                continue
-    
-    if total_tokens > 0:
-        avg_loss = total_loss / total_tokens
-        accuracy = total_correct / total_tokens
-        perplexity = torch.exp(torch.tensor(min(avg_loss, 20))).item()
-    else:
-        avg_loss = float('inf')
-        accuracy = 0.0
-        perplexity = float('inf')
-    
-    model.train()
-    return {
-        'val_loss': avg_loss,
-        'val_accuracy': accuracy,
-        'val_perplexity': perplexity
-    }
-
-def train_blt_pipeline(entropy_model_path: str, config: Dict[str, Any]):
-    """Complete BLT training pipeline"""
-    
-    print(f"🚀 BLT TRAINING PIPELINE")
-    print(f"=" * 50)
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    
-    # Step 1: Load entropy model
-    print(f"\n1️⃣ Loading entropy model...")
-    config_path = entropy_model_path.replace('.pth', '_config.pth')
-    entropy_model, entropy_config = load_entropy_model(entropy_model_path, config_path)
-    
-    if entropy_model is None:
-        print(f"❌ Could not load entropy model from {entropy_model_path}")
-        print(f"   Train entropy model first: python entropy_llm.py")
-        return
-    
-    entropy_model = entropy_model.to(device)
-    print(f"✅ Loaded entropy model with {sum(p.numel() for p in entropy_model.parameters()):,} parameters")
-    
-    # Step 2: Load data
-    print(f"\n2️⃣ Loading training data...")
-    texts, bytes_data = load_and_cache_data(entropy_config)
-    
-    # Convert bytes back to texts for BLT processing
-    if not texts:
-        # If we only have bytes, convert back to text (lossy but necessary)
-        chunk_size = 1000
-        texts = []
-        for i in range(0, len(bytes_data), chunk_size):
-            chunk = bytes_data[i:i+chunk_size]
-            try:
-                text = bytes(chunk).decode('utf-8', errors='ignore')
-                if len(text.strip()) > 10:
-                    texts.append(text)
-            except:
-                continue
-    
-    print(f"✅ Loaded {len(texts)} text documents")
-    
-    # Step 3: Create entropy patcher
-    print(f"\n3️⃣ Creating entropy patcher...")
-    patcher = EntropyPatcher(entropy_model, threshold=config['entropy_threshold'], method='global')
-    
-    # Step 4: Create BLT dataset
-    print(f"\n4️⃣ Creating BLT dataset...")
-    dataset = BLTDataset(texts[:config['max_documents']], patcher, config['max_seq_len'])
-    
-    if len(dataset) == 0:
-        print(f"❌ No valid data for training!")
-        return
-    
-    # Split dataset
-    val_size = max(1, len(dataset) // 10)
-    train_size = len(dataset) - val_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
+    # Create patcher
+    patcher = EntropyPatcher(
+        entropy_model, 
+        threshold=0.6,
+        method=config.patching_method
     )
     
-    # Create data loaders
+    # Load data
+    print("Loading training data...")
+    from datasets import load_dataset
+    dataset = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", 
+                          split="train", streaming=True)
+    
+    byte_sequences = []
+    for i, item in enumerate(tqdm(dataset, desc="Loading data", total=config.num_documents)):
+        if i >= config.num_documents:
+            break
+        text_bytes = list(item["text"][:3000].encode('utf-8'))
+        byte_sequences.append(text_bytes)
+    
+    # Find optimal threshold
+    patcher.find_optimal_threshold(byte_sequences[:100], config.target_patch_size)
+    
+    # Create dataset
+    train_dataset = BLTDataset(byte_sequences, patcher, config.max_seq_len)
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=True, 
-        collate_fn=collate_blt_batch,
+        batch_size=config.batch_size,
+        shuffle=True,
         num_workers=2
     )
     
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config['batch_size'], 
-        shuffle=False, 
-        collate_fn=collate_blt_batch,
-        num_workers=2
-    )
+    # Initialize model
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model_config = get_model_config(config.model_size)
+    model = BLTModel(model_config).to(device)
     
-    print(f"✅ Created datasets: {len(train_dataset)} train, {len(val_dataset)} val")
-    
-    # Step 5: Initialize BLT model
-    print(f"\n5️⃣ Initializing BLT model...")
-    blt_config = BLTConfig(
-        encoder_layers=config['encoder_layers'],
-        encoder_dim=config['encoder_dim'],
-        global_layers=config['global_layers'],
-        global_dim=config['global_dim'],
-        decoder_layers=config['decoder_layers'],
-        decoder_dim=config['decoder_dim'],
-        vocab_size=256,
-        max_seq_len=config['max_seq_len']
-    )
-    
-    model = BLTModel(blt_config).to(device)
     total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params:,}")
+    print(f"  Encoder: {sum(p.numel() for p in model.local_encoder.parameters()):,}")
+    print(f"  Global: {sum(p.numel() for p in model.global_transformer.parameters()):,}")
+    print(f"  Decoder: {sum(p.numel() for p in model.local_decoder.parameters()):,}")
     
-    print(f"✅ BLT Model initialized:")
-    print(f"   Encoder: {blt_config.encoder_layers}L, {blt_config.encoder_dim}d")
-    print(f"   Global: {blt_config.global_layers}L, {blt_config.global_dim}d")
-    print(f"   Decoder: {blt_config.decoder_layers}L, {blt_config.decoder_dim}d")
-    print(f"   Total parameters: {total_params:,}")
+    # Setup optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     
-    # Step 6: Setup training
-    print(f"\n6️⃣ Setting up training...")
-    optimizer = setup_blt_optimizer(model, config['learning_rate'])
+    # Cosine schedule with warmup
+    def lr_lambda(step):
+        if step < config.warmup_steps:
+            return step / config.warmup_steps
+        progress = (step - config.warmup_steps) / (config.max_steps - config.warmup_steps)
+        return 0.5 * (1 + math.cos(math.pi * progress))
     
-    # Learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config['max_steps'], eta_min=config['learning_rate'] * 0.1
-    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    # Step 7: Training loop
-    print(f"\n7️⃣ Starting BLT training...")
+    # Training loop
     model.train()
     step = 0
-    best_val_loss = float('inf')
+    accumulation_counter = 0
+    accumulated_loss = 0
     
-    pbar = tqdm(total=config['max_steps'], desc="Training BLT")
+    pbar = tqdm(total=config.max_steps, desc="Training BLT")
     
-    while step < config['max_steps']:
-        for batch in train_loader:
-            if step >= config['max_steps']:
+    while step < config.max_steps:
+        for x, y, boundaries in train_loader:
+            if step >= config.max_steps:
                 break
             
-            try:
-                bytes_input = batch['bytes'].to(device)
-                target_bytes = batch['target_bytes'].to(device)
-                patch_boundaries = batch['patch_boundaries']
-                
-                # Forward pass
-                predictions = model(bytes_input, patch_boundaries)
-                
-                # Compute loss
-                loss = F.cross_entropy(
-                    predictions.view(-1, model.config.vocab_size),
-                    target_bytes.view(-1),
-                    ignore_index=0
-                )
-                
-                # Backward pass
-                optimizer.zero_grad()
-                loss.backward()
+            x = x.to(device)
+            y = y.to(device) 
+            boundaries = boundaries.to(device)
+            
+            # Forward pass
+            logits = model(x, boundaries)
+            loss = F.cross_entropy(logits.view(-1, 256), y.view(-1), ignore_index=0)
+            loss = loss / config.gradient_accumulation
+            
+            loss.backward()
+            accumulated_loss += loss.item()
+            accumulation_counter += 1
+            
+            # Optimizer step
+            if accumulation_counter >= config.gradient_accumulation:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad()
                 
-                # Logging
-                if step % 100 == 0:
+                # Update progress
+                if step % 10 == 0:
+                    avg_loss = accumulated_loss * config.gradient_accumulation
                     pbar.set_postfix({
-                        'loss': f'{loss.item():.4f}',
-                        'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+                        'loss': f'{avg_loss:.4f}',
+                        'lr': f'{scheduler.get_last_lr()[0]:.2e}'
                     })
                 
-                # Evaluation
-                if step % config['eval_every'] == 0 and step > 0:
-                    eval_metrics = evaluate_blt_model(model, val_loader, device)
-                    print(f"\nStep {step}: Val Loss: {eval_metrics['val_loss']:.4f}, "
-                          f"Val Acc: {eval_metrics['val_accuracy']:.4f}")
-                    
-                    if eval_metrics['val_loss'] < best_val_loss:
-                        best_val_loss = eval_metrics['val_loss']
-                        torch.save(model.state_dict(), 'best_blt_model.pth')
+                accumulated_loss = 0
+                accumulation_counter = 0
+                step += 1
+                pbar.update(1)
                 
-                step += 1
-                if step % 100 == 0:
-                    pbar.update(100)
+                # Evaluation
+                if step % config.eval_every == 0:
+                    model.eval()
                     
-            except Exception as e:
-                print(f"⚠️ Training step failed: {e}")
-                step += 1
-                continue
+                    # Generate sample
+                    prompt = "The future of AI is"
+                    prompt_bytes = list(prompt.encode('utf-8'))
+                    generated = model.generate(prompt_bytes, max_length=100)
+                    
+                    print(f"\n[Step {step}] Generated: {generated}")
+                    
+                    model.train()
+                
+                # Save checkpoint
+                if step % config.save_every == 0:
+                    checkpoint = {
+                        'step': step,
+                        'model_state': model.state_dict(),
+                        'optimizer_state': optimizer.state_dict(),
+                        'scheduler_state': scheduler.state_dict(),
+                        'config': config
+                    }
+                    torch.save(checkpoint, f'blt_checkpoint_{step}.pt')
+                    print(f"Saved checkpoint at step {step}")
     
     pbar.close()
-    
-    # Final evaluation
-    print(f"\n8️⃣ Final evaluation...")
-    final_metrics = evaluate_blt_model(model, val_loader, device)
-    
-    print(f"\n🎉 BLT TRAINING COMPLETED!")
-    print(f"Final Results:")
-    print(f"   Loss: {final_metrics['val_loss']:.4f}")
-    print(f"   Accuracy: {final_metrics['val_accuracy']:.4f}")
-    print(f"   Perplexity: {final_metrics['val_perplexity']:.2f}")
+    print("✅ Training complete!")
     
     # Save final model
-    torch.save(model.state_dict(), 'final_blt_model.pth')
-    torch.save(blt_config, 'blt_config.pth')
-    print(f"💾 Saved model to final_blt_model.pth")
+    torch.save(model.state_dict(), 'blt_final.pt')
+    
+    return model
 
 def main():
-    parser = argparse.ArgumentParser(description="Train BLT model")
-    parser.add_argument("--entropy_model_path", type=str, default="entropy_model.pth",
-                       help="Path to trained entropy model")
-    parser.add_argument("--quick_demo", action="store_true",
-                       help="Run quick demo with small model")
+    """Main entry point"""
+    # First train entropy model if needed
+    import os
+    if not os.path.exists('entropy_model.pt'):
+        print("Training entropy model first...")
+        from train_entropy_model import train_entropy_model, EntropyModelConfig
+        entropy_config = EntropyModelConfig()
+        train_entropy_model(entropy_config)
     
-    args = parser.parse_args()
+    # Train BLT
+    config = TrainingConfig(
+        model_size="small",
+        batch_size=16,
+        max_steps=10000,
+        target_patch_size=6.0
+    )
     
-    set_seed(42)
+    model = train_blt(config)
     
-    # Configuration
-    if args.quick_demo:
-        config = {
-            'entropy_threshold': 0.6,
-            'max_documents': 50,
-            'max_seq_len': 256,
-            'batch_size': 4,
-            'max_steps': 500,
-            'eval_every': 100,
-            'learning_rate': 1e-4,
-            
-            # BLT architecture (small)
-            'encoder_layers': 1,
-            'encoder_dim': 256,
-            'global_layers': 6,
-            'global_dim': 1024,
-            'decoder_layers': 3,
-            'decoder_dim': 256
-        }
-    else:
-        config = {
-            'entropy_threshold': 0.6,
-            'max_documents': 500,
-            'max_seq_len': 512,
-            'batch_size': 8,
-            'max_steps': 5000,
-            'eval_every': 500,
-            'learning_rate': 1e-4,
-            
-            # BLT architecture (full)
-            'encoder_layers': 1,
-            'encoder_dim': 768,
-            'global_layers': 24,
-            'global_dim': 4096,
-            'decoder_layers': 6,
-            'decoder_dim': 768
-        }
+    # Final generation test
+    print("\n🎯 Final Generation Test:")
+    test_prompts = [
+        "Once upon a time",
+        "The meaning of life is",
+        "In the year 2050"
+    ]
     
-    try:
-        train_blt_pipeline(args.entropy_model_path, config)
-    except Exception as e:
-        print(f"❌ Training failed: {e}")
-        import traceback
-        traceback.print_exc()
+    model.eval()
+    for prompt in test_prompts:
+        prompt_bytes = list(prompt.encode('utf-8'))
+        generated = model.generate(prompt_bytes, max_length=150)
+        print(f"\nPrompt: {prompt}")
+        print(f"Generated: {generated}")
 
 if __name__ == "__main__":
     main()

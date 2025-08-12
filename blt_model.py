@@ -2,417 +2,437 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from typing import List, Tuple, Optional
 from dataclasses import dataclass
+from typing import Optional, Tuple
+import hashlib
 
 @dataclass
 class BLTConfig:
-    # Local Encoder (lightweight)
+    # Local Encoder
     encoder_layers: int = 1
     encoder_dim: int = 768
     encoder_heads: int = 12
+    encoder_window: int = 512
     
-    # Global Latent Transformer (heavyweight)
+    # Global Latent Transformer
     global_layers: int = 24
-    global_dim: int = 4096
-    global_heads: int = 32
+    global_dim: int = 1280
+    global_heads: int = 10
     
-    # Local Decoder
-    decoder_layers: int = 6
+    # Local Decoder  
+    decoder_layers: int = 7
     decoder_dim: int = 768
     decoder_heads: int = 12
+    decoder_window: int = 512
     
-    # General
-    vocab_size: int = 256  # byte vocabulary
-    max_seq_len: int = 2048
-    dropout: float = 0.1
+    # Cross-attention
+    cross_attn_heads: int = 8
+    k_factor: int = 2  # ratio of global_dim to encoder/decoder_dim
     
     # N-gram embeddings
-    use_ngram_embeddings: bool = True
-    ngram_sizes: List[int] = None
-    hash_vocab_size: int = 100000
+    ngram_sizes: list = None
+    ngram_vocab_size: int = 500000
+    
+    # Training
+    max_seq_len: int = 8192  # in bytes
+    dropout: float = 0.1
     
     def __post_init__(self):
         if self.ngram_sizes is None:
             self.ngram_sizes = [3, 4, 5, 6, 7, 8]
+        assert self.global_dim == self.encoder_dim * self.k_factor
 
-class NGramHashEmbedding(nn.Module):
-    """N-gram hash embeddings for byte sequences"""
-    
-    def __init__(self, ngram_sizes: List[int], hash_vocab_size: int, embed_dim: int):
-        super().__init__()
-        self.ngram_sizes = ngram_sizes
-        self.hash_vocab_size = hash_vocab_size
+class RollingHash:
+    """Rolling polynomial hash for n-grams"""
+    def __init__(self, vocab_size=500000):
+        self.vocab_size = vocab_size
+        self.prime = 31
         
-        # Separate embedding for each n-gram size
+    def hash(self, bytes_seq):
+        """Compute hash for byte sequence"""
+        h = 0
+        for b in bytes_seq:
+            h = (h * self.prime + b) % self.vocab_size
+        return h
+
+class HashNgramEmbeddings(nn.Module):
+    """Hash-based n-gram embeddings"""
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.hasher = RollingHash(config.ngram_vocab_size)
+        
+        # Create embedding tables for each n-gram size
         self.embeddings = nn.ModuleDict({
-            f'ngram_{n}': nn.Embedding(hash_vocab_size, embed_dim)
-            for n in ngram_sizes
+            str(n): nn.Embedding(config.ngram_vocab_size, config.encoder_dim)
+            for n in config.ngram_sizes
         })
         
-        self.projection = nn.Linear(len(ngram_sizes) * embed_dim, embed_dim)
-    
-    def _hash_ngram(self, ngram: List[int]) -> int:
-        """Simple hash function for n-grams"""
-        hash_val = 0
-        for byte_val in ngram:
-            hash_val = (hash_val * 256 + byte_val) % self.hash_vocab_size
-        return hash_val
-    
-    def forward(self, byte_sequence: torch.Tensor) -> torch.Tensor:
+    def forward(self, byte_ids):
         """
-        Args:
-            byte_sequence: [batch_size, seq_len]
-        Returns:
-            embeddings: [batch_size, seq_len, embed_dim]
+        byte_ids: [batch, seq_len]
+        Returns: [batch, seq_len, dim]
         """
-        batch_size, seq_len = byte_sequence.shape
-        device = byte_sequence.device
+        B, T = byte_ids.shape
+        device = byte_ids.device
         
-        # Collect embeddings for all n-gram sizes
-        all_embeddings = []
+        # Base byte embeddings
+        base_embed = torch.zeros(B, T, self.config.encoder_dim, device=device)
         
-        for n in self.ngram_sizes:
-            ngram_embeddings = torch.zeros(batch_size, seq_len, self.embeddings[f'ngram_{n}'].embedding_dim, device=device)
+        # Add n-gram embeddings
+        for n in self.config.ngram_sizes:
+            n_str = str(n)
+            ngram_embeds = torch.zeros(B, T, self.config.encoder_dim, device=device)
             
-            for i in range(seq_len - n + 1):
-                # Extract n-gram
-                ngram = byte_sequence[:, i:i+n].cpu().numpy()
-                
-                # Hash each n-gram in the batch
-                hash_ids = []
-                for b in range(batch_size):
-                    hash_id = self._hash_ngram(ngram[b].tolist())
-                    hash_ids.append(hash_id)
-                
-                hash_tensor = torch.tensor(hash_ids, device=device)
-                embed = self.embeddings[f'ngram_{n}'](hash_tensor)
-                
-                # Assign to center position of n-gram
-                center_pos = i + n // 2
-                if center_pos < seq_len:
-                    ngram_embeddings[:, center_pos] = embed
+            for b in range(B):
+                for t in range(T):
+                    if t >= n - 1:
+                        # Get n-gram
+                        ngram = byte_ids[b, t-n+1:t+1].cpu().numpy()
+                        hash_idx = self.hasher.hash(ngram)
+                        ngram_embeds[b, t] = self.embeddings[n_str](
+                            torch.tensor(hash_idx, device=device)
+                        )
             
-            all_embeddings.append(ngram_embeddings)
+            base_embed += ngram_embeds
         
-        # Concatenate and project
-        combined = torch.cat(all_embeddings, dim=-1)
-        return self.projection(combined)
+        # Normalize by number of n-gram sizes + 1
+        return base_embed / (len(self.config.ngram_sizes) + 1)
+
+class CrossAttention(nn.Module):
+    """Cross-attention for byte-patch conversion"""
+    def __init__(self, query_dim, kv_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = query_dim // num_heads
+        
+        self.q_proj = nn.Linear(query_dim, query_dim)
+        self.k_proj = nn.Linear(kv_dim, query_dim)  
+        self.v_proj = nn.Linear(kv_dim, query_dim)
+        self.out_proj = nn.Linear(query_dim, query_dim)
+        
+        self.norm_q = nn.LayerNorm(query_dim)
+        self.norm_kv = nn.LayerNorm(kv_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, queries, keys_values, mask=None):
+        """
+        queries: [batch, num_queries, query_dim]
+        keys_values: [batch, seq_len, kv_dim]
+        mask: [batch, num_queries, seq_len]
+        """
+        B, NQ, _ = queries.shape
+        _, T, _ = keys_values.shape
+        
+        # Pre-norm
+        queries = self.norm_q(queries)
+        keys_values = self.norm_kv(keys_values)
+        
+        # Project
+        Q = self.q_proj(queries).reshape(B, NQ, self.num_heads, self.head_dim)
+        K = self.k_proj(keys_values).reshape(B, T, self.num_heads, self.head_dim)
+        V = self.v_proj(keys_values).reshape(B, T, self.num_heads, self.head_dim)
+        
+        # Transpose for attention
+        Q = Q.transpose(1, 2)  # [B, heads, NQ, head_dim]
+        K = K.transpose(1, 2)  # [B, heads, T, head_dim]
+        V = V.transpose(1, 2)  # [B, heads, T, head_dim]
+        
+        # Attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        
+        if mask is not None:
+            mask = mask.unsqueeze(1)  # Add head dimension
+            scores = scores.masked_fill(mask == 0, -1e9)
+        
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
+        out = torch.matmul(attn, V)
+        out = out.transpose(1, 2).reshape(B, NQ, -1)
+        
+        return self.out_proj(out)
 
 class LocalEncoder(nn.Module):
-    """Local encoder: bytes → patches"""
-    
-    def __init__(self, config: BLTConfig):
+    """Encodes bytes into patch representations"""
+    def __init__(self, config):
         super().__init__()
         self.config = config
         
         # Byte embeddings
-        self.byte_embedding = nn.Embedding(config.vocab_size, config.encoder_dim)
+        self.byte_embed = nn.Embedding(256, config.encoder_dim)
+        self.ngram_embed = HashNgramEmbeddings(config)
         
-        # N-gram hash embeddings
-        if config.use_ngram_embeddings:
-            self.ngram_embedding = NGramHashEmbedding(
-                config.ngram_sizes, config.hash_vocab_size, config.encoder_dim
-            )
+        # Transformer layers with cross-attention
+        self.layers = nn.ModuleList()
+        for _ in range(config.encoder_layers):
+            self.layers.append(nn.ModuleDict({
+                'self_attn': nn.TransformerEncoderLayer(
+                    d_model=config.encoder_dim,
+                    nhead=config.encoder_heads,
+                    dim_feedforward=config.encoder_dim * 4,
+                    dropout=config.dropout,
+                    batch_first=True
+                ),
+                'cross_attn': CrossAttention(
+                    query_dim=config.encoder_dim,
+                    kv_dim=config.encoder_dim,
+                    num_heads=config.cross_attn_heads,
+                    dropout=config.dropout
+                ),
+                'norm': nn.LayerNorm(config.encoder_dim)
+            }))
         
-        # Transformer layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=config.encoder_dim,
-            nhead=config.encoder_heads,
-            dim_feedforward=config.encoder_dim * 4,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, config.encoder_layers)
+    def forward(self, byte_ids, patch_boundaries):
+        """
+        byte_ids: [batch, seq_len]
+        patch_boundaries: [batch, seq_len] binary mask where 1 indicates patch start
+        Returns: [batch, num_patches, encoder_dim * k_factor]
+        """
+        B, T = byte_ids.shape
         
-        # Patch pooling
-        self.patch_query = nn.Parameter(torch.randn(config.encoder_dim))
-        self.patch_attention = nn.MultiheadAttention(
-            config.encoder_dim, config.encoder_heads, batch_first=True
-        )
+        # Embed bytes
+        byte_embeds = self.byte_embed(byte_ids)
+        ngram_embeds = self.ngram_embed(byte_ids)
+        x = byte_embeds + ngram_embeds
+        
+        # Process through encoder layers
+        for layer in self.layers:
+            # Self-attention over bytes
+            x = layer['self_attn'](x)
+            
+            # Cross-attention to create patches
+            # Initialize patch queries by pooling bytes in each patch
+            patch_queries = self._init_patch_queries(x, patch_boundaries)
+            
+            # Create attention mask
+            attn_mask = self._create_patch_mask(patch_boundaries)
+            
+            # Cross-attention
+            patch_reprs = layer['cross_attn'](patch_queries, x, attn_mask)
+            patch_reprs = layer['norm'](patch_reprs + patch_queries)
+        
+        # Expand to global dimension
+        patch_reprs = patch_reprs.repeat(1, 1, self.config.k_factor)
+        
+        return patch_reprs
     
-    def forward(self, bytes_input: torch.Tensor, patch_boundaries: List[List[Tuple[int, int]]]) -> torch.Tensor:
-        """
-        Args:
-            bytes_input: [batch_size, seq_len] byte sequences
-            patch_boundaries: List of patch boundaries for each sequence
-        Returns:
-            patch_representations: [batch_size, num_patches, encoder_dim]
-        """
-        batch_size, seq_len = bytes_input.shape
+    def _init_patch_queries(self, byte_reprs, patch_boundaries):
+        """Initialize patch queries by pooling bytes"""
+        B, T, D = byte_reprs.shape
+        device = byte_reprs.device
         
-        # Byte embeddings
-        byte_embeds = self.byte_embedding(bytes_input)
+        # Find patch indices
+        patch_starts = []
+        for b in range(B):
+            starts = torch.where(patch_boundaries[b] == 1)[0]
+            if len(starts) == 0:
+                starts = torch.tensor([0], device=device)
+            patch_starts.append(starts)
         
-        # Add n-gram embeddings if enabled
-        if self.config.use_ngram_embeddings:
-            ngram_embeds = self.ngram_embedding(bytes_input)
-            byte_embeds = byte_embeds + ngram_embeds
+        # Pool bytes for each patch
+        max_patches = max(len(starts) for starts in patch_starts)
+        queries = torch.zeros(B, max_patches, D, device=device)
         
-        # Apply transformer
-        encoded = self.transformer(byte_embeds)
+        for b in range(B):
+            starts = patch_starts[b]
+            for i, start_idx in enumerate(starts):
+                if i < len(starts) - 1:
+                    end_idx = starts[i + 1]
+                else:
+                    end_idx = T
+                    
+                # Max pooling
+                queries[b, i] = byte_reprs[b, start_idx:end_idx].max(dim=0)[0]
         
-        # Pool into patches
-        patch_representations = []
+        return queries
+    
+    def _create_patch_mask(self, patch_boundaries):
+        """Create attention mask for patches to bytes"""
+        B, T = patch_boundaries.shape
+        device = patch_boundaries.device
         
-        for b in range(batch_size):
-            batch_patches = []
-            boundaries = patch_boundaries[b]
-            
-            for start, end in boundaries:
-                # Extract patch bytes
-                patch_bytes = encoded[b, start:end]  # [patch_len, encoder_dim]
-                
-                # Pool using attention with learnable query
-                query = self.patch_query.unsqueeze(0).unsqueeze(0)  # [1, 1, encoder_dim]
-                patch_repr, _ = self.patch_attention(
-                    query, patch_bytes.unsqueeze(0), patch_bytes.unsqueeze(0)
-                )
-                batch_patches.append(patch_repr.squeeze(0).squeeze(0))
-            
-            if batch_patches:
-                patch_representations.append(torch.stack(batch_patches))
-            else:
-                # Handle empty case
-                patch_representations.append(torch.zeros(1, self.config.encoder_dim, device=bytes_input.device))
+        # Find patch assignments for each byte
+        patch_ids = torch.cumsum(patch_boundaries, dim=1) - 1
+        max_patches = patch_ids.max().item() + 1
         
-        # Pad to same length
-        max_patches = max(p.size(0) for p in patch_representations)
-        padded_patches = []
+        # Create mask
+        mask = torch.zeros(B, max_patches, T, device=device)
+        for b in range(B):
+            for t in range(T):
+                patch_id = patch_ids[b, t]
+                mask[b, patch_id, t] = 1
         
-        for patches in patch_representations:
-            if patches.size(0) < max_patches:
-                padding = torch.zeros(max_patches - patches.size(0), self.config.encoder_dim, device=bytes_input.device)
-                patches = torch.cat([patches, padding], dim=0)
-            padded_patches.append(patches)
-        
-        return torch.stack(padded_patches)
+        return mask
 
 class GlobalTransformer(nn.Module):
-    """Global latent transformer: patches → patches"""
-    
-    def __init__(self, config: BLTConfig):
+    """Large transformer over patch representations"""
+    def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Project encoder dim to global dim if different
-        if config.encoder_dim != config.global_dim:
-            self.input_projection = nn.Linear(config.encoder_dim, config.global_dim)
-        else:
-            self.input_projection = nn.Identity()
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=config.global_dim,
+                nhead=config.global_heads,
+                dim_feedforward=config.global_dim * 4,
+                dropout=config.dropout,
+                batch_first=True
+            ) for _ in range(config.global_layers)
+        ])
         
-        # Global transformer layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.global_dim,
-            nhead=config.global_heads,
-            dim_feedforward=config.global_dim * 4,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerDecoder(decoder_layer, config.global_layers)
+        self.norm = nn.LayerNorm(config.global_dim)
         
-        # Position embeddings for patches
-        self.pos_embedding = nn.Embedding(1000, config.global_dim)  # Support up to 1000 patches
-    
-    def forward(self, patch_representations: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        Args:
-            patch_representations: [batch_size, num_patches, encoder_dim]
-        Returns:
-            global_outputs: [batch_size, num_patches, global_dim]
+        x: [batch, num_patches, global_dim]
         """
-        batch_size, num_patches, _ = patch_representations.shape
-        
-        # Project to global dimension
-        x = self.input_projection(patch_representations)
-        
-        # Add position embeddings
-        positions = torch.arange(num_patches, device=x.device)
-        pos_embeds = self.pos_embedding(positions).unsqueeze(0).expand(batch_size, -1, -1)
-        x = x + pos_embeds
-        
         # Create causal mask for patches
-        causal_mask = torch.triu(torch.ones(num_patches, num_patches, device=x.device), diagonal=1).bool()
+        T = x.size(1)
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
         
-        # Apply transformer with causal attention
-        output = self.transformer(x, x, tgt_mask=causal_mask)
+        for layer in self.layers:
+            x = layer(x, src_mask=mask)
         
-        return output
+        return self.norm(x)
 
 class LocalDecoder(nn.Module):
-    """Local decoder: patches → bytes"""
-    
-    def __init__(self, config: BLTConfig):
+    """Decodes patch representations back to bytes"""
+    def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Project global dim to decoder dim if different
-        if config.global_dim != config.decoder_dim:
-            self.input_projection = nn.Linear(config.global_dim, config.decoder_dim)
-        else:
-            self.input_projection = nn.Identity()
+        # Initial byte representations from encoder
+        self.layers = nn.ModuleList()
+        for _ in range(config.decoder_layers):
+            self.layers.append(nn.ModuleDict({
+                'cross_attn': CrossAttention(
+                    query_dim=config.decoder_dim,
+                    kv_dim=config.global_dim,
+                    num_heads=config.cross_attn_heads,
+                    dropout=config.dropout
+                ),
+                'self_attn': nn.TransformerEncoderLayer(
+                    d_model=config.decoder_dim,
+                    nhead=config.decoder_heads,
+                    dim_feedforward=config.decoder_dim * 4,
+                    dropout=config.dropout,
+                    batch_first=True
+                ),
+                'norm': nn.LayerNorm(config.decoder_dim)
+            }))
         
-        # Decoder transformer layers
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.decoder_dim,
-            nhead=config.decoder_heads,
-            dim_feedforward=config.decoder_dim * 4,
-            dropout=config.dropout,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerDecoder(decoder_layer, config.decoder_layers)
+        self.output_proj = nn.Linear(config.decoder_dim, 256)
         
-        # Output projection to vocabulary
-        self.output_projection = nn.Linear(config.decoder_dim, config.vocab_size)
-        
-        # Byte position embeddings
-        self.byte_pos_embedding = nn.Embedding(config.max_seq_len, config.decoder_dim)
-    
-    def forward(self, patch_representations: torch.Tensor, 
-                encoder_hidden_states: torch.Tensor,
-                patch_boundaries: List[List[Tuple[int, int]]]) -> torch.Tensor:
+    def forward(self, patch_reprs, encoder_hidden, patch_boundaries):
         """
-        Args:
-            patch_representations: [batch_size, num_patches, global_dim]
-            encoder_hidden_states: [batch_size, seq_len, encoder_dim] from local encoder
-            patch_boundaries: List of patch boundaries for each sequence
-        Returns:
-            byte_predictions: [batch_size, seq_len, vocab_size]
+        patch_reprs: [batch, num_patches, global_dim]
+        encoder_hidden: [batch, seq_len, encoder_dim]
+        patch_boundaries: [batch, seq_len]
         """
-        batch_size, seq_len, _ = encoder_hidden_states.shape
+        B, T, D = encoder_hidden.shape
         
-        # Project patch representations
-        patch_repr = self.input_projection(patch_representations)
+        # Start with encoder hidden states
+        x = encoder_hidden
         
-        # Create byte-level representations using cross-attention
-        byte_outputs = []
+        # Create patch-to-byte mask
+        attn_mask = self._create_byte_to_patch_mask(patch_boundaries)
         
-        for b in range(batch_size):
-            boundaries = patch_boundaries[b]
-            byte_sequence = torch.zeros(seq_len, self.config.decoder_dim, device=patch_repr.device)
+        for layer in self.layers:
+            # Cross-attention: bytes attend to patches
+            patch_info = layer['cross_attn'](x, patch_reprs, attn_mask)
+            x = layer['norm'](x + patch_info)
             
-            for patch_idx, (start, end) in enumerate(boundaries):
-                if patch_idx < patch_repr.size(1):
-                    # Get patch representation
-                    patch_vec = patch_repr[b, patch_idx].unsqueeze(0).unsqueeze(0)  # [1, 1, decoder_dim]
-                    
-                    # Get byte positions for this patch
-                    patch_len = end - start
-                    if patch_len > 0:
-                        # Create queries for each byte position in patch
-                        byte_positions = torch.arange(start, end, device=patch_repr.device)
-                        pos_embeds = self.byte_pos_embedding(byte_positions)
-                        
-                        # Use cross-attention to decode bytes from patch
-                        decoded_bytes, _ = nn.functional.multi_head_attention_forward(
-                            pos_embeds, patch_vec.expand(-1, patch_len, -1), patch_vec.expand(-1, patch_len, -1),
-                            self.config.decoder_dim, self.config.decoder_heads,
-                            torch.zeros(self.config.decoder_dim * 3, device=patch_repr.device),
-                            None, None, False, 0.0, 
-                            nn.Linear(self.config.decoder_dim, self.config.decoder_dim).weight,
-                            nn.Linear(self.config.decoder_dim, self.config.decoder_dim).weight,
-                            nn.Linear(self.config.decoder_dim, self.config.decoder_dim).weight,
-                            training=self.training
-                        )
-                        
-                        byte_sequence[start:end] = decoded_bytes
-            
-            byte_outputs.append(byte_sequence)
-        
-        byte_representations = torch.stack(byte_outputs)
-        
-        # Apply decoder transformer
-        decoded = self.transformer(byte_representations, patch_repr)
+            # Self-attention over bytes
+            x = layer['self_attn'](x)
         
         # Project to vocabulary
-        logits = self.output_projection(decoded)
+        logits = self.output_proj(x)
         
         return logits
+    
+    def _create_byte_to_patch_mask(self, patch_boundaries):
+        """Create mask for bytes attending to their patch"""
+        B, T = patch_boundaries.shape
+        
+        # Assign patch IDs to bytes
+        patch_ids = torch.cumsum(patch_boundaries, dim=1) - 1
+        max_patches = patch_ids.max().item() + 1
+        
+        # Create mask [batch, seq_len, num_patches]
+        mask = torch.zeros(B, T, max_patches, device=patch_boundaries.device)
+        for b in range(B):
+            for t in range(T):
+                patch_id = patch_ids[b, t]
+                # Each byte can attend to its patch and all previous patches
+                mask[b, t, :patch_id+1] = 1
+        
+        return mask
 
 class BLTModel(nn.Module):
-    """Complete BLT model with all three components"""
-    
-    def __init__(self, config: BLTConfig):
+    """Complete Byte Latent Transformer"""
+    def __init__(self, config):
         super().__init__()
         self.config = config
         
-        # Component 1: Local Encoder (bytes → patches)
         self.local_encoder = LocalEncoder(config)
-        
-        # Component 2: Global Latent Transformer (patches → patches)
         self.global_transformer = GlobalTransformer(config)
-        
-        # Component 3: Local Decoder (patches → bytes)
         self.local_decoder = LocalDecoder(config)
-    
-    def forward(self, bytes_input: torch.Tensor, patch_boundaries: List[List[Tuple[int, int]]]) -> torch.Tensor:
+        
+    def forward(self, byte_ids, patch_boundaries):
         """
-        End-to-end forward pass
-        
-        Args:
-            bytes_input: [batch_size, seq_len] byte sequences
-            patch_boundaries: List of patch boundaries for each sequence
-        Returns:
-            byte_predictions: [batch_size, seq_len, vocab_size]
+        byte_ids: [batch, seq_len] input bytes
+        patch_boundaries: [batch, seq_len] patch boundaries (1 at start of patch)
+        Returns: [batch, seq_len, 256] byte predictions
         """
-        # Step 1: Encode bytes to patches
-        patch_representations = self.local_encoder(bytes_input, patch_boundaries)
+        # Encode bytes to patches
+        patch_reprs = self.local_encoder(byte_ids, patch_boundaries)
         
-        # Step 2: Process patches through global transformer
-        global_outputs = self.global_transformer(patch_representations)
+        # Store encoder hidden states for decoder
+        encoder_hidden = self.local_encoder.byte_embed(byte_ids) + \
+                        self.local_encoder.ngram_embed(byte_ids)
         
-        # Step 3: Decode patches back to bytes
-        byte_predictions = self.local_decoder(
-            global_outputs, 
-            patch_representations,  # Use as encoder hidden states
-            patch_boundaries
-        )
+        # Process patches through global transformer  
+        global_outputs = self.global_transformer(patch_reprs)
         
-        return byte_predictions
-
-def train_blt(model: BLTModel, patched_data, config, optimizer):
-    """Train the complete BLT model end-to-end"""
-    model.train()
+        # Decode patches back to bytes
+        byte_logits = self.local_decoder(global_outputs, encoder_hidden, patch_boundaries)
+        
+        return byte_logits
     
-    for batch in patched_data:
-        # batch contains: bytes, patch_boundaries, target_bytes
-        bytes_input = batch['bytes']  # [batch_size, seq_len]
-        patch_boundaries = batch['patch_boundaries']  # List of boundaries
-        target_bytes = batch['target_bytes']  # [batch_size, seq_len]
+    def generate(self, prompt_bytes, max_length=100, temperature=0.8):
+        """Generate bytes autoregressively"""
+        self.eval()
+        device = next(self.parameters()).device
         
-        # Forward pass through entire model
-        byte_predictions = model(bytes_input, patch_boundaries)
+        generated = prompt_bytes.copy()
         
-        # Compute loss on byte predictions
-        loss = F.cross_entropy(
-            byte_predictions.view(-1, model.config.vocab_size), 
-            target_bytes.view(-1)
-        )
+        with torch.no_grad():
+            for _ in range(max_length):
+                # Prepare input
+                x = torch.tensor([generated[-self.config.max_seq_len:]], 
+                               dtype=torch.long, device=device)
+                
+                # Create dummy patch boundaries (for simplicity, patch every 8 bytes)
+                boundaries = torch.zeros_like(x)
+                boundaries[0, ::8] = 1
+                
+                # Forward pass
+                logits = self.forward(x, boundaries)
+                
+                # Sample next byte
+                next_byte_logits = logits[0, -1] / temperature
+                probs = F.softmax(next_byte_logits, dim=-1)
+                next_byte = torch.multinomial(probs, 1).item()
+                
+                generated.append(next_byte)
+                
+                # Try to decode
+                try:
+                    text = bytes(generated).decode('utf-8')
+                    if text.endswith(('.', '!', '?', '\n')):
+                        break
+                except:
+                    continue
         
-        # Backprop through entire model
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        yield loss.item()
-
-# Example usage
-if __name__ == "__main__":
-    # Create BLT configuration
-    config = BLTConfig(
-        encoder_layers=1,
-        encoder_dim=768,
-        global_layers=24,
-        global_dim=4096,
-        decoder_layers=6,
-        decoder_dim=768
-    )
-    
-    # Initialize model
-    model = BLTModel(config)
-    
-    print(f"BLT Model created with:")
-    print(f"  Encoder: {config.encoder_layers}L, {config.encoder_dim}d")
-    print(f"  Global: {config.global_layers}L, {config.global_dim}d") 
-    print(f"  Decoder: {config.decoder_layers}L, {config.decoder_dim}d")
-    print(f"  Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+        return bytes(generated).decode('utf-8', errors='ignore')
