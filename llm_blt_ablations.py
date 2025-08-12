@@ -393,7 +393,7 @@ def analyze_patch_statistics(texts: List[str], patcher, num_samples: int = 100, 
     
     return stats
 
-def generate_with_blt(model: BLT, patcher, prompt: str = "The", max_patches: int = 20, temperature: float = 0.8):
+def generate_with_blt(model, patcher, prompt: str = "The", max_patches: int = 20, temperature: float = 0.8):
     """Generate text using the BLT model"""
     model.eval()
     device = next(model.parameters()).device
