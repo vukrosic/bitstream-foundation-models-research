@@ -150,7 +150,8 @@ class SimpleLocalEncoder(nn.Module):
     def __init__(self, config: SimpleConfig):
         super().__init__()
         self.byte_embedding = nn.Embedding(config.vocab_size, config.local_d_model)
-        self.transformer = SimpleTransformerBlock(config.local_d_model, 2, config.local_d_model * 2, config.max_patch_len)
+        # Use 4 heads for 64-dim model (64/4 = 16)
+        self.transformer = SimpleTransformerBlock(config.local_d_model, 4, config.local_d_model * 2, config.max_patch_len)
         self.norm = nn.RMSNorm(config.local_d_model)
         self.to_patch_embedding = nn.Linear(config.local_d_model, config.d_model)
         
