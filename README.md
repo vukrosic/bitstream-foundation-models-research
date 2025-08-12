@@ -1,5 +1,9 @@
 # Byte Latent Transformer (BLT) Research
 
+YouTube video - https://youtu.be/SLtLP6J9xTk
+
+Bilibili video - https://www.bilibili.com/video/BV1BjtRzMER3/
+
 ## Research Questions & Future Directions
 
 ### Research Questions Ideas
