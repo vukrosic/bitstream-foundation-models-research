@@ -588,6 +588,13 @@ if __name__ == "__main__":
     print(f"   Validation Accuracy: {final_metrics['val_accuracy']:.4f}")
     print(f"   Validation Perplexity: {final_metrics['val_perplexity']:.2f}")
     
+    # Save the trained model
+    print(f"\n💾 Saving entropy model...")
+    torch.save(model.state_dict(), 'entropy_model.pth')
+    torch.save(config, 'entropy_model_config.pth')
+    print(f"   Model weights saved to: entropy_model.pth")
+    print(f"   Model config saved to: entropy_model_config.pth")
+    
     # Additional generation samples
     print(f"\n🎨 ADDITIONAL GENERATION SAMPLES:")
     print("=" * 60)

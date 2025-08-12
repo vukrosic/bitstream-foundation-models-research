@@ -197,7 +197,8 @@ def train_blt_pipeline(entropy_model_path: str, config: Dict[str, Any]):
     
     # Step 1: Load entropy model
     print(f"\n1️⃣ Loading entropy model...")
-    entropy_model, entropy_config = load_entropy_model(entropy_model_path, entropy_model_path.replace('.pth', '_config.pth'))
+    config_path = entropy_model_path.replace('.pth', '_config.pth')
+    entropy_model, entropy_config = load_entropy_model(entropy_model_path, config_path)
     
     if entropy_model is None:
         print(f"❌ Could not load entropy model from {entropy_model_path}")
