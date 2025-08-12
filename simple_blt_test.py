@@ -46,7 +46,7 @@ class SimpleConfig:
     
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, f"d_model ({self.d_model}) must be divisible by n_heads ({self.n_heads})"
-        assert self.local_d_model % 2 == 0, f"local_d_model ({self.local_d_model}) must be divisible by 2 (for local attention)"
+        assert self.local_d_model % 4 == 0, f"local_d_model ({self.local_d_model}) must be divisible by 4 (for local attention with 4 heads)"
 
 class SimpleRotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -200,7 +200,8 @@ class SimpleLocalDecoder(nn.Module):
         super().__init__()
         self.from_patch_embedding = nn.Linear(config.d_model, config.local_d_model)
         self.byte_embedding = nn.Embedding(config.vocab_size, config.local_d_model)
-        self.transformer = SimpleTransformerBlock(config.local_d_model, 2, config.local_d_model * 2, config.max_patch_len)
+        # Use 4 heads for 64-dim model (64/4 = 16)
+        self.transformer = SimpleTransformerBlock(config.local_d_model, 4, config.local_d_model * 2, config.max_patch_len)
         self.norm = nn.RMSNorm(config.local_d_model)
         self.to_byte_logits = nn.Linear(config.local_d_model, config.vocab_size)
         
