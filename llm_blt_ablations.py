@@ -46,9 +46,9 @@ class ModelConfig:
     muon_lr: float = 0.01
 
     # Data parameters
-    max_seq_len: int = 128  # In patches, not bytes
-    num_documents: int = 1000  # Reduced for initial testing
-    max_tokens: int = 200000
+    max_seq_len: int = 64  # Reduced sequence length
+    num_documents: int = 500  # Fewer documents
+    max_tokens: int = 100000  # Fewer tokens
 
     # BLT specific parameters
     patch_size: int = 8  # Fixed patch size for simplicity
@@ -1106,7 +1106,7 @@ def train_blt_model_with_metrics(config: ModelConfig, train_loader: DataLoader, 
                 metrics_history.append(metrics)
                 step_times = []  # Reset for next batch
 
-            # Logging
+            # Logging and text generation
             if step % 100 == 0:
                 current_loss = loss.item() * config.gradient_accumulation_steps
                 perplexity = math.exp(min(current_loss, 20))
@@ -1116,6 +1116,16 @@ def train_blt_model_with_metrics(config: ModelConfig, train_loader: DataLoader, 
                     'ppl': f'{perplexity:.1f}',
                     'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
                 })
+                
+                # Generate sample text to show progress
+                if step in [0, 100, 200, 300]:
+                    print(f"\n🎯 Step {step} - Generating sample text (threshold={threshold}):")
+                    try:
+                        sample_text = generate_with_blt(model, patcher, prompt="The quick brown", max_patches=15, temperature=0.8)
+                        print(f"   Generated: '{sample_text}'")
+                    except Exception as e:
+                        print(f"   Generation failed: {str(e)[:50]}...")
+                    print()  # Extra line for readability
 
             # Evaluation
             if step % config.eval_every == 0 and step > 0:
@@ -1404,8 +1414,9 @@ def run_ablation_study():
 
     # Create config for BLT model
     config = ModelConfig()
-    config.max_steps = 3000  # Reduced for ablation study
-    config.track_metrics_every = 50
+    config.max_steps = 300  # Very quick ablation study
+    config.track_metrics_every = 100  # Less frequent tracking
+    config.eval_every = 200  # Less frequent evaluation
     
     print(f"\n📋 BLT Ablation Study Configuration:")
     print(f"   Architecture: {config.d_model}d, {config.n_layers}L, {config.n_heads}H, {config.d_ff}ff")
