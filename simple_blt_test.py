@@ -86,7 +86,11 @@ class SimpleAttention(nn.Module):
         self.rotary = SimpleRotary(self.d_k, max_seq_len)
 
     def forward(self, x):
-        batch_size, seq_len, d_model = x.shape
+        # Handle different input shapes
+        if x.dim() == 2:
+            x = x.unsqueeze(0)  # Add batch dimension if missing
+        
+        batch_size, seq_len = x.size(0), x.size(1)
         
         # Project to Q, K, V
         qkv = self.qkv(x)  # (batch_size, seq_len, d_model * 3)
@@ -154,15 +158,24 @@ class SimpleLocalEncoder(nn.Module):
         device = self.byte_embedding.weight.device
         patch_embeddings = []
         
-        for patch in byte_patches:
+        for i, patch in enumerate(byte_patches):
             patch = patch.to(device)
-            embedded_bytes = self.byte_embedding(patch.unsqueeze(0))
-            x = self.transformer(embedded_bytes)
-            pooled = self.norm(x).mean(dim=1)
-            patch_emb = self.to_patch_embedding(pooled)
+            # patch shape: (patch_size,)
+            embedded_bytes = self.byte_embedding(patch.unsqueeze(0))  # (1, patch_size, local_d_model)
+            
+            # Debug: print shapes
+            if i == 0:  # Only print for first patch to avoid spam
+                print(f"Debug - patch shape: {patch.shape}")
+                print(f"Debug - embedded_bytes shape: {embedded_bytes.shape}")
+            
+            x = self.transformer(embedded_bytes)  # Should be (1, patch_size, local_d_model)
+            pooled = self.norm(x).mean(dim=1)  # (1, local_d_model)
+            patch_emb = self.to_patch_embedding(pooled)  # (1, d_model)
             patch_embeddings.append(patch_emb)
         
-        return torch.cat(patch_embeddings, dim=0).unsqueeze(0)
+        # Stack all patch embeddings
+        result = torch.cat(patch_embeddings, dim=0).unsqueeze(0)  # (1, num_patches, d_model)
+        return result
 
 class SimpleLatentTransformer(nn.Module):
     def __init__(self, config: SimpleConfig):
