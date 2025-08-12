@@ -360,30 +360,29 @@ class LocalEncoder(nn.Module):
                     if start < end and end <= max_bytes:
                         queries[b, p] = byte_hidden[b, start:end].mean(dim=0)
         
-        # 4. Batched cross-attention
-        # Reshape for batched processing
-        queries_flat = queries.view(-1, 1, self.config.h_encoder)  # [batch*max_patches, 1, h_encoder]
+        # 4. Process patches one by one (simpler and more reliable)
+        patch_vecs = torch.zeros(batch_size, max_patches, self.config.h_encoder, device=bytes_tensor.device)
         
-        # Expand byte_hidden for each patch
-        byte_hidden_expanded = byte_hidden.unsqueeze(1).expand(-1, max_patches, -1, -1)
-        keys_flat = byte_hidden_expanded.reshape(-1, max_bytes, self.config.h_encoder)
-        values_flat = keys_flat
+        for b in range(batch_size):
+            for p in range(max_patches):
+                if valid_patches[b, p]:
+                    start, end = boundaries[b, p]
+                    if start < end and end <= max_bytes:
+                        # Get bytes for this patch
+                        patch_bytes = byte_hidden[b:b+1, start:end]  # [1, patch_len, h_encoder]
+                        
+                        # Query: mean-pooled patch representation
+                        query = patch_bytes.mean(dim=1, keepdim=True)  # [1, 1, h_encoder]
+                        
+                        # Cross-attention: query attends to patch bytes
+                        patch_vec, _ = self.cross_attn(
+                            query=query,
+                            key=patch_bytes,
+                            value=patch_bytes
+                        )
+                        patch_vecs[b, p] = patch_vec.squeeze(1).squeeze(0)  # [h_encoder]
         
-        # Create attention mask
-        attn_mask_flat = attn_mask.view(-1, 1, max_bytes)
-        attn_mask_flat = attn_mask_flat.masked_fill(attn_mask_flat == 0, float('-inf'))
-        attn_mask_flat = attn_mask_flat.masked_fill(attn_mask_flat == 1, 0.0)
-        
-        # Single cross-attention call
-        patch_vecs, _ = self.cross_attn(
-            query=queries_flat,
-            key=keys_flat,
-            value=values_flat,
-            attn_mask=attn_mask_flat
-        )
-        
-        # Reshape back
-        patch_vecs = patch_vecs.view(batch_size, max_patches, self.config.h_encoder)
+
         
         # 5. Project to main model dimension
         patch_vecs_projected = self.patch_proj(patch_vecs)
