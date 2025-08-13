@@ -35,7 +35,7 @@ class ModelConfig:
     n_layers: int = 6
     d_ff: int = 1536
     batch_size: int = 24
-    max_steps: int = 300  # Reduced for speed
+    max_steps: int = 5000
 
     # Training parameters
     gradient_accumulation_steps: int = 4
@@ -47,7 +47,7 @@ class ModelConfig:
     max_tokens: int = 500000
 
     # Evaluation
-    eval_every: int = 100  # More frequent for shorter training
+    eval_every: int = 500
     eval_steps: int = 50
 
     # Regularization
@@ -651,6 +651,66 @@ def evaluate_model(model: nn.Module, val_loader: DataLoader, config: ModelConfig
     model.train()
     return {'val_loss': avg_loss, 'val_accuracy': accuracy, 'val_perplexity': perplexity}
 
+def generate_text(model: nn.Module, config: ModelConfig, prompt: str = "", max_length: int = 200, temperature: float = 0.8):
+    """Generate text from the model"""
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Special tokens
+    PAD_TOKEN = 256
+    EOS_TOKEN = 257
+    
+    # Convert prompt to bytes if provided
+    if prompt:
+        tokens = list(prompt.encode('utf-8'))
+    else:
+        tokens = []
+    
+    # Ensure we have at least one token to start with
+    if not tokens:
+        tokens = [ord('T')]  # Start with 'T'
+    
+    generated_tokens = tokens.copy()
+    
+    with torch.no_grad():
+        for _ in range(max_length):
+            # Take last seq_len tokens for context
+            context = generated_tokens[-config.max_seq_len:]
+            x = torch.tensor([context], dtype=torch.long, device=device)
+            
+            # Pad if necessary
+            if x.size(1) < config.max_seq_len:
+                padding = torch.full((1, config.max_seq_len - x.size(1)), PAD_TOKEN, dtype=torch.long, device=device)
+                x = torch.cat([padding, x], dim=1)
+            
+            # Get logits for next token
+            logits = model(x)
+            next_token_logits = logits[0, -1, :] / temperature
+            
+            # Sample next token (avoid special tokens for generation)
+            probs = F.softmax(next_token_logits, dim=-1)
+            # Zero out special tokens
+            probs[PAD_TOKEN] = 0
+            probs[EOS_TOKEN] = 0
+            probs = probs / probs.sum()  # Renormalize
+            
+            next_token = torch.multinomial(probs, 1).item()
+            
+            # Stop if we hit EOS or invalid byte
+            if next_token >= 256:
+                break
+                
+            generated_tokens.append(next_token)
+    
+    # Convert back to text
+    try:
+        # Only use valid byte values
+        valid_bytes = [b for b in generated_tokens if 0 <= b < 256]
+        text = bytes(valid_bytes).decode('utf-8', errors='ignore')
+        return text
+    except:
+        return "Generated invalid bytes"
+
 def setup_muon_optimizer(model: nn.Module, config: ModelConfig):
     """Setup Muon optimizer with hybrid approach"""
     muon_params = []
@@ -711,6 +771,13 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
         schedulers.append(scheduler)
 
     scaler = GradScaler() if config.use_amp else None
+
+    # Generate initial text (before training)
+    print(f"\n🎯 INITIAL TEXT GENERATION (Step 0):")
+    print("=" * 60)
+    initial_text = generate_text(model, config, prompt="The", max_length=150)
+    print(f"Generated: {initial_text}")
+    print("=" * 60)
 
     # Training loop
     model.train()
@@ -792,6 +859,14 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                 if eval_metrics['val_loss'] < best_val_loss:
                     best_val_loss = eval_metrics['val_loss']
 
+                # Generate text at middle of training (around step 2500)
+                if step == config.max_steps // 2:
+                    print(f"\n🎯 MIDDLE TEXT GENERATION (Step {step}):")
+                    print("=" * 60)
+                    middle_text = generate_text(model, config, prompt="The", max_length=150)
+                    print(f"Generated: {middle_text}")
+                    print("=" * 60)
+
             step += 1
             if step % 50 == 0:
                 pbar.update(50)
@@ -800,6 +875,13 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
 
     training_time = time.time() - start_time
     print(f"  ⏱️ Training completed in {training_time:.1f} seconds")
+
+    # Generate final text (after training)
+    print(f"\n🎯 FINAL TEXT GENERATION (Step {config.max_steps}):")
+    print("=" * 60)
+    final_text = generate_text(model, config, prompt="The", max_length=150)
+    print(f"Generated: {final_text}")
+    print("=" * 60)
 
     # Final evaluation
     final_eval = evaluate_model(model, val_loader, config)
