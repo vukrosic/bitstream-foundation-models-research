@@ -10,6 +10,8 @@ A complete implementation of entropy-based data patching for language model trai
 
 - Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
 - Which threshold of entropy is best
+- We can experiment with patch size, architecture, etc...but we need to understand it all, we can create fun experiments that will help us understand this
+- We need to just setup experiments, my LLM currently just trains on a single GPU, but that would be enough for now, I have a project that will make it multiple GPUs
 
 ## Overview
 
