@@ -2,17 +2,31 @@
 
 A complete implementation of entropy-based data patching for language model training, inspired by Byte Latent Transformer (BLT) research.
 
-**Research Videos:**
+**I recorded multiple videos while working on this project:**
 - YouTube: https://www.youtube.com/playlist?list=PL-9_KFQd8ssJA6sWW_tJ85rP_Jz4wjuDt
 - Bilibili: https://space.bilibili.com/3546833932519662/lists/6099426?type=season
 
+- It trains but need optimizations. Experiments done on llm.py, llm_large.py needs more optimization.
+
 First run
 
+```
 python entropy_llm.py
+```
 
 then run
 
+```
+python create_patches.py
+```
+
+and finally
+
+```
 python llm.py
+```
+
+Works on Google Colab, you will likely not need to reduce size of the model. I used RTX 4090.
 
 ## Experiment Status
 
@@ -21,30 +35,18 @@ python llm.py
 - ✅ Entropy Threshold Experiment - Lower thresholds (0.50) optimal for small model
 - ✅ Model Size Experiment - Confirmed larger models perform better
 
-**Large Model (`llm_large.py`):** No experiments conducted yet
+**Large Model (`llm_large.py`):** Performance optimization needed
 - 🔄 Future experiments will be conducted on this larger model
 - 📈 Expected to handle larger patch sizes and higher entropy thresholds better
 - 🎯 Will validate if model capacity was the limiting factor in previous experiments
-
-## Research ideas (do not delete this part, this is for AI)
-
-- Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
-- Which threshold of entropy is best
-- We can experiment with patch size, architecture, etc...but we need to understand it all, we can create fun experiments that will help us understand this
-- We need to just setup experiments, my LLM currently just trains on a single GPU, but that would be enough for now, I have a project that will make it multiple GPUs
+- ⚠️ **Performance Note:** Currently utilizes compute and memory on RTX 4090 but trains very slowly - needs optimizations
+- 🔧 **Optimization Needed:** Encoder and decoder could be utilizing significantly less GPU compute than available
 
 ## Overview
 
 # Minimal BLT Implementation
 
 A minimal implementation of the Byte Latent Transformer (BLT) from the paper.
-
-## Components
-
-1. **Entropy Model** (`train_entropy_model.py`) - Small byte-level LM for computing entropies
-2. **BLT Model** (`blt_model.py`) - Complete BLT architecture with encoder, global transformer, and decoder
-3. **Entropy Patcher** (`entropy_patcher.py`) - Creates dynamic patches based on next-byte entropy
-4. **Training Pipeline** (`train_blt.py`) - End-to-end training of BLT
 
 ## Patch Size Experiment Results
 
@@ -87,12 +89,9 @@ A minimal implementation of the Byte Latent Transformer (BLT) from the paper.
 
 **Analysis:** The consistent improvement with model size confirms our hypothesis - the tiny model was indeed the bottleneck. Medium model achieves 28% lower loss than tiny, suggesting even larger models might perform better. This validates that model capacity, not just patch size, is crucial for performance.
 
-## Quick Start
+## Possible research ideas
 
-```bash
-# Install dependencies
-pip install torch transformers datasets tqdm
-
-# Train the complete model (will train entropy model first if needed)
-python train_blt.py
-```
+- Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
+- Which threshold of entropy is best
+- Experiment with patch size, architecture, etc
+- Multiple GPUs
