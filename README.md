@@ -6,6 +6,14 @@ A complete implementation of entropy-based data patching for language model trai
 - YouTube: https://www.youtube.com/playlist?list=PL-9_KFQd8ssJA6sWW_tJ85rP_Jz4wjuDt
 - Bilibili: https://space.bilibili.com/3546833932519662/lists/6099426?type=season
 
+First run
+
+python entropy_llm.py
+
+then run
+
+python llm.py
+
 ## Research ideas (do not delete this part, this is for AI)
 
 - Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
@@ -54,6 +62,18 @@ A minimal implementation of the Byte Latent Transformer (BLT) from the paper.
 | 3.00      | 131.0    | 3.5250 | 24.2%    | 34.0       |
 
 **Analysis:** Threshold 0.50 produces the best results with very small patches (avg 2.2 bytes). This confirms our model is too small for complex patterns - it performs best when processing tiny, simple chunks. The exponential performance degradation with higher thresholds shows the model can't handle the complexity of longer sequences.
+
+## Model Size Experiment Results
+
+**Key Finding:** Larger models perform significantly better with optimal patch settings.
+
+| Model  | d_model | Layers | Loss   | Accuracy | Perplexity |
+|--------|---------|--------|--------|----------|------------|
+| Tiny   | 256     | 4      | 0.4648 | 87.1%    | 1.6        |
+| Small  | 384     | 6      | 0.3874 | 89.1%    | 1.5        |
+| Medium | 512     | 8      | 0.3323 | 90.4%    | 1.4        |
+
+**Analysis:** The consistent improvement with model size confirms our hypothesis - the tiny model was indeed the bottleneck. Medium model achieves 28% lower loss than tiny, suggesting even larger models might perform better. This validates that model capacity, not just patch size, is crucial for performance.
 
 ## Quick Start
 
