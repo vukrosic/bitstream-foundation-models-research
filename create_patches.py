@@ -7,7 +7,7 @@ from tqdm import tqdm
 from typing import List
 from entropy_llm import EntropyLLM, ModelConfig, load_and_cache_data, text_to_bytes, bytes_to_text, compute_entropy
 
-def create_patches_global_threshold(byte_sequence: List[int], entropies: np.ndarray, threshold: float = 1.5) -> List[List[int]]:
+def create_patches_global_threshold(byte_sequence: List[int], entropies: np.ndarray, threshold: float = 0.5) -> List[List[int]]:
     """Create patches when entropy exceeds global threshold. Returns list of byte chunks."""
     patches = []
     current_patch = []
@@ -104,7 +104,7 @@ def load_model_and_create_patches():
     print(f"✅ Computed entropies for {len(all_entropies)} chunks")
     
     # Find optimal threshold for target patch size
-    target_patch_size = 6.0  # Middle range as requested
+    target_patch_size = 2.2  # Optimal size from experiments
     print(f"🎯 Finding threshold for target patch size: {target_patch_size} bytes")
     
     threshold = find_threshold_for_target_patch_size(all_entropies, target_patch_size)

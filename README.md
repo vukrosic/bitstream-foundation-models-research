@@ -40,6 +40,21 @@ A minimal implementation of the Byte Latent Transformer (BLT) from the paper.
 
 **Analysis:** The dramatic performance drop with larger patches suggests our model is too small to effectively process longer sequences. Smaller patches (size 3) allow the model to focus on local patterns it can actually learn, while larger patches overwhelm its limited capacity.
 
+## Entropy Threshold Experiment Results
+
+**Key Finding:** Lower entropy thresholds work best, confirming our small model hypothesis.
+
+| Threshold | Avg Size | Loss   | Accuracy | Perplexity |
+|-----------|----------|--------|----------|------------|
+| 0.50      | 2.2      | 0.3490 | 90.0%    | 1.4        |
+| 1.00      | 3.5      | 0.6472 | 81.6%    | 1.9        |
+| 1.50      | 5.9      | 1.1035 | 67.6%    | 3.0        |
+| 2.00      | 10.5     | 1.5891 | 54.1%    | 4.9        |
+| 2.50      | 24.3     | 2.1463 | 38.5%    | 8.6        |
+| 3.00      | 131.0    | 3.5250 | 24.2%    | 34.0       |
+
+**Analysis:** Threshold 0.50 produces the best results with very small patches (avg 2.2 bytes). This confirms our model is too small for complex patterns - it performs best when processing tiny, simple chunks. The exponential performance degradation with higher thresholds shows the model can't handle the complexity of longer sequences.
+
 ## Quick Start
 
 ```bash
