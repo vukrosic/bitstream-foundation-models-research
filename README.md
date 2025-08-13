@@ -3,8 +3,8 @@
 A complete implementation of entropy-based data patching for language model training, inspired by Byte Latent Transformer (BLT) research.
 
 **Research Videos:**
-- YouTube: https://youtu.be/SLtLP6J9xTk
-- Bilibili: https://www.bilibili.com/video/BV1BjtRzMER3/
+- YouTube: https://www.youtube.com/playlist?list=PL-9_KFQd8ssJA6sWW_tJ85rP_Jz4wjuDt
+- Bilibili: https://space.bilibili.com/3546833932519662/lists/6099426?type=season
 
 ## Overview
 
