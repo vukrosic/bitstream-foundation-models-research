@@ -35,9 +35,3 @@ pip install torch transformers datasets tqdm
 # Train the complete model (will train entropy model first if needed)
 python train_blt.py
 ```
-
----
-
-Architecture seems implemented, a bit slow to train due to encder and decoder. There are probably optimizations to be done.
-
-I need to find out why it's so slow, what takes so much time. Probably inspect the llm.py code to understand it well also.
