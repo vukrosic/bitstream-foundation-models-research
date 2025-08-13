@@ -10,8 +10,8 @@ import os
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-from entropy_llm import EntropyLLM, ModelConfig, load_and_cache_data, compute_entropy
-from llm import BLT_LLM, PatchDataset, train_model, collate_batch
+from entropy_llm import EntropyLLM, load_and_cache_data, compute_entropy
+from llm import BLT_LLM, PatchDataset, train_model, collate_batch, ModelConfig
 from torch.utils.data import DataLoader
 
 def create_patches_with_target_size(byte_sequence: List[int], entropies: np.ndarray, target_avg_size: float, show_examples: bool = False) -> List[List[int]]:
@@ -288,7 +288,10 @@ def analyze_patch_size_performance():
             best_loss = r['val_loss']
             best_size = target_size
     
-    print(f"\n🏆 Best performance: patch size {best_size:.1f} with loss {best_loss:.4f}")
+    if best_size is not None:
+        print(f"\n🏆 Best performance: patch size {best_size:.1f} with loss {best_loss:.4f}")
+    else:
+        print(f"\n❌ No successful training runs - all failed")
     
     # Show detailed text samples
     print(f"\n📝 DETAILED TEXT SAMPLES")
