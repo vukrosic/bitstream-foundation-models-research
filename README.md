@@ -14,6 +14,18 @@ then run
 
 python llm.py
 
+## Experiment Status
+
+**Current Model (`llm.py`):** All experiments completed on the smaller model
+- ✅ Patch Size Experiment - Results show smaller patches (size 3) work best
+- ✅ Entropy Threshold Experiment - Lower thresholds (0.50) optimal for small model
+- ✅ Model Size Experiment - Confirmed larger models perform better
+
+**Large Model (`llm_large.py`):** No experiments conducted yet
+- 🔄 Future experiments will be conducted on this larger model
+- 📈 Expected to handle larger patch sizes and higher entropy thresholds better
+- 🎯 Will validate if model capacity was the limiting factor in previous experiments
+
 ## Research ideas (do not delete this part, this is for AI)
 
 - Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
