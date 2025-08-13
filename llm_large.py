@@ -34,7 +34,7 @@ class ModelConfig:
     n_heads: int = 16    # Increased from 8
     n_layers: int = 12   # Increased from 6
     d_ff: int = 4096     # Increased from 1536
-    batch_size: int = 128 # Reduced slightly to fit larger model
+    batch_size: int = 512 # Increased to better utilize GPU memory
     max_steps: int = 400
 
     # Training parameters
@@ -840,12 +840,19 @@ def train_model(config: ModelConfig, train_loader: DataLoader, val_loader: DataL
                     accuracy = (predictions == targets).float().mean().item()
                     current_loss = loss.item() * config.gradient_accumulation_steps
                     perplexity = math.exp(min(current_loss, 20))
+                    
+                    # GPU memory monitoring
+                    if torch.cuda.is_available():
+                        memory_used = torch.cuda.memory_allocated() / 1e9
+                        memory_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+                        memory_percent = (memory_used / memory_total) * 100
 
                 pbar.set_postfix({
                     'loss': f'{current_loss:.4f}',
                     'acc': f'{accuracy:.3f}',
                     'ppl': f'{perplexity:.1f}',
-                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}'
+                    'lr': f'{optimizers[0].param_groups[0]["lr"]:.2e}',
+                    'mem': f'{memory_percent:.1f}%'
                 })
 
             # Evaluation
@@ -923,7 +930,7 @@ if __name__ == "__main__":
 
     train_loader = DataLoader(
         train_dataset, 
-        batch_size=config.batch_size * 2,  # Increase batch size
+        batch_size=config.batch_size * 3,  # Increase batch size further
         shuffle=True, 
         num_workers=2,  # Use multiple workers
         pin_memory=True,  # Pin memory for faster GPU transfer
@@ -931,7 +938,7 @@ if __name__ == "__main__":
     )
     val_loader = DataLoader(
         val_dataset, 
-        batch_size=config.batch_size * 2, 
+        batch_size=config.batch_size * 3, 
         shuffle=False, 
         num_workers=2, 
         pin_memory=True,
