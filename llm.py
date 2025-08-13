@@ -656,56 +656,55 @@ def generate_text(model: nn.Module, config: ModelConfig, prompt: str = "", max_l
     model.eval()
     device = next(model.parameters()).device
     
-    # Special tokens
-    PAD_TOKEN = 256
-    EOS_TOKEN = 257
-    
     # Convert prompt to bytes if provided
     if prompt:
         tokens = list(prompt.encode('utf-8'))
     else:
-        tokens = []
-    
-    # Ensure we have at least one token to start with
-    if not tokens:
         tokens = [ord('T')]  # Start with 'T'
+    
+    # Pad to max_bytes (100)
+    max_bytes = 100
+    if len(tokens) > max_bytes:
+        tokens = tokens[:max_bytes]
+    else:
+        tokens.extend([0] * (max_bytes - len(tokens)))
+    
+    # Create dummy boundaries and valid_patches for generation
+    # Treat the whole sequence as one patch
+    boundaries = torch.zeros(1, 15, 2, dtype=torch.long, device=device)  # max_patches=15
+    valid_patches = torch.zeros(1, 15, dtype=torch.bool, device=device)
+    boundaries[0, 0] = torch.tensor([0, len(tokens)])
+    valid_patches[0, 0] = True
     
     generated_tokens = tokens.copy()
     
     with torch.no_grad():
         for _ in range(max_length):
-            # Take last seq_len tokens for context
-            context = generated_tokens[-config.max_seq_len:]
-            x = torch.tensor([context], dtype=torch.long, device=device)
+            # Prepare input
+            x = torch.tensor([generated_tokens], dtype=torch.long, device=device)
             
-            # Pad if necessary
-            if x.size(1) < config.max_seq_len:
-                padding = torch.full((1, config.max_seq_len - x.size(1)), PAD_TOKEN, dtype=torch.long, device=device)
-                x = torch.cat([padding, x], dim=1)
-            
-            # Get logits for next token
-            logits = model(x)
+            # Get logits
+            logits = model(x, boundaries, valid_patches)
             next_token_logits = logits[0, -1, :] / temperature
             
-            # Sample next token (avoid special tokens for generation)
-            probs = F.softmax(next_token_logits, dim=-1)
-            # Zero out special tokens
-            probs[PAD_TOKEN] = 0
-            probs[EOS_TOKEN] = 0
-            probs = probs / probs.sum()  # Renormalize
-            
+            # Sample next token (only valid bytes 0-255)
+            probs = F.softmax(next_token_logits[:256], dim=-1)  # Only first 256 for valid bytes
             next_token = torch.multinomial(probs, 1).item()
             
-            # Stop if we hit EOS or invalid byte
-            if next_token >= 256:
+            # Stop if we hit padding or invalid byte
+            if next_token == 0:
                 break
                 
             generated_tokens.append(next_token)
+            
+            # Update for next iteration - keep last max_bytes tokens
+            if len(generated_tokens) > max_bytes:
+                generated_tokens = generated_tokens[-max_bytes:]
     
     # Convert back to text
     try:
-        # Only use valid byte values
-        valid_bytes = [b for b in generated_tokens if 0 <= b < 256]
+        # Only use valid byte values, skip padding zeros
+        valid_bytes = [b for b in generated_tokens if 0 < b < 256]
         text = bytes(valid_bytes).decode('utf-8', errors='ignore')
         return text
     except:
