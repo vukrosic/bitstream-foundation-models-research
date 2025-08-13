@@ -26,6 +26,20 @@ A minimal implementation of the Byte Latent Transformer (BLT) from the paper.
 3. **Entropy Patcher** (`entropy_patcher.py`) - Creates dynamic patches based on next-byte entropy
 4. **Training Pipeline** (`train_blt.py`) - End-to-end training of BLT
 
+## Patch Size Experiment Results
+
+**Key Finding:** Smaller patch sizes perform significantly better with our current model size.
+
+| Patch Size | Loss   | Accuracy | Perplexity |
+|------------|--------|----------|------------|
+| 3.0        | 0.4915 | 85.9%    | 1.6        |
+| 5.0        | 0.9812 | 71.6%    | 2.7        |
+| 7.0        | 1.2738 | 62.5%    | 3.6        |
+| 10.0       | 1.5947 | 53.3%    | 4.9        |
+| 12.0       | 1.7342 | 49.3%    | 5.7        |
+
+**Analysis:** The dramatic performance drop with larger patches suggests our model is too small to effectively process longer sequences. Smaller patches (size 3) allow the model to focus on local patterns it can actually learn, while larger patches overwhelm its limited capacity.
+
 ## Quick Start
 
 ```bash
