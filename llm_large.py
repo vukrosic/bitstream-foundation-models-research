@@ -34,7 +34,7 @@ class ModelConfig:
     n_heads: int = 16    # Increased from 8
     n_layers: int = 12   # Increased from 6
     d_ff: int = 4096     # Increased from 1536
-    batch_size: int = 16 # Reduced slightly to fit larger model
+    batch_size: int = 32 # Reduced slightly to fit larger model
     max_steps: int = 400
 
     # Training parameters
