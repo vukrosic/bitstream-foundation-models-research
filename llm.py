@@ -64,6 +64,14 @@ class ModelConfig:
     h_decoder: int = 192  # Half of d_model
     n_encoder_layers: int = 1
     n_decoder_layers: int = 2
+    
+    # Cross-attention parameters
+    cross_attn_encoder: bool = True
+    cross_attn_decoder: bool = True
+    cross_attn_nheads: int = 4
+    cross_attn_all_layers_encoder: bool = False
+    cross_attn_all_layers_decoder: bool = False
+    norm_eps: float = 1e-5
 
     def __post_init__(self):
         self.d_k = self.d_model // self.n_heads
@@ -267,6 +275,42 @@ class MultiHeadAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2).reshape(batch_size, seq_len, self.d_model)
         return self.w_o(attn_output)
 
+class CrossAttention(nn.Module):
+    def __init__(self, dim: int, head_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float = 1e-5):
+        super().__init__()
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        
+        self.wq = nn.Linear(dim, n_heads * head_dim, bias=False)
+        self.wk = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.wv = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
+        self.wo = nn.Linear(n_heads * head_dim, dim, bias=False)
+        
+        self.norm = nn.RMSNorm(dim, eps=norm_eps)
+        
+    def forward(self, x: torch.Tensor, kv: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        # x: query [batch, seq_len, dim]
+        # kv: key/value [batch, kv_seq_len, dim]
+        batch_size, seq_len, _ = x.shape
+        kv_seq_len = kv.shape[1]
+        
+        # Apply norm to query
+        x_norm = self.norm(x)
+        
+        # Compute Q, K, V
+        q = self.wq(x_norm).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.wk(kv).view(batch_size, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.wv(kv).view(batch_size, kv_seq_len, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        attn_output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        
+        # Reshape and project
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        return self.wo(attn_output)
+
 class FeedForward(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
@@ -311,25 +355,37 @@ class LocalEncoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.cross_attn_encoder = config.cross_attn_encoder
+        self.cross_attn_all_layers_encoder = config.cross_attn_all_layers_encoder
         
         # Byte embedding
         self.byte_embed = nn.Embedding(config.vocab_size, config.h_encoder)
         
-        # Small transformer for processing bytes
-        self.byte_transformer = TransformerBlock(
-            config.h_encoder, 
-            max(1, config.h_encoder // 64),  # At least 1 head
-            config.h_encoder * 2, 
-            100,  # Max bytes
-            config.dropout
-        )
+        # Transformer layers for processing bytes
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                config.h_encoder, 
+                max(1, config.h_encoder // 64),
+                config.h_encoder * 2, 
+                100,
+                config.dropout
+            )
+            for _ in range(config.n_encoder_layers)
+        ])
         
-        # Cross-attention to pool bytes into patch vectors
-        self.cross_attn = nn.MultiheadAttention(
-            config.h_encoder, 
-            num_heads=max(1, config.h_encoder // 64), 
-            batch_first=True
-        )
+        # Cross-attention layers
+        if self.cross_attn_encoder:
+            layers_to_add = config.n_encoder_layers if self.cross_attn_all_layers_encoder else 1
+            self.cross_attn_layers = nn.ModuleList([
+                CrossAttention(
+                    dim=config.h_encoder,
+                    head_dim=config.h_encoder // config.cross_attn_nheads,
+                    n_heads=config.cross_attn_nheads,
+                    n_kv_heads=config.cross_attn_nheads,
+                    norm_eps=config.norm_eps
+                )
+                for _ in range(layers_to_add)
+            ])
         
         # Project to main model dimension
         self.patch_proj = nn.Linear(config.h_encoder, config.d_model)
@@ -343,73 +399,80 @@ class LocalEncoder(nn.Module):
             print(f"   Boundaries shape: {boundaries.shape}")
             print(f"   Valid patches: {valid_patches.sum().item()}")
         
-        # 1. Embed and transform bytes
-        byte_embeds = self.byte_embed(bytes_tensor)
-        byte_hidden = self.byte_transformer(byte_embeds)
+        # 1. Embed bytes
+        h = self.byte_embed(bytes_tensor)
+        h = F.dropout(h, p=self.config.dropout, training=self.training)
         
-        # 2. Create attention mask for all patches at once
-        attn_mask = create_patch_mask(boundaries, valid_patches, max_bytes)
+        # 2. Apply transformer layers
+        for i, layer in enumerate(self.layers):
+            h = layer(h)
+            
+            # Apply cross-attention if enabled
+            if self.cross_attn_encoder and (i == len(self.layers) - 1 or self.cross_attn_all_layers_encoder):
+                # Create patch embeddings by pooling
+                patch_embeds = self._create_patch_embeddings(h, boundaries, valid_patches, batch_size, max_patches, max_bytes)
+                
+                # Apply cross-attention
+                layer_idx = i if self.cross_attn_all_layers_encoder else 0
+                patch_embeds_cross = self.cross_attn_layers[layer_idx](
+                    x=patch_embeds,
+                    kv=h
+                )
+                patch_embeds = patch_embeds + patch_embeds_cross
         
-        # 3. Create queries by masked pooling
-        queries = torch.zeros(batch_size, max_patches, self.config.h_encoder, device=bytes_tensor.device)
+        # 3. Create final patch embeddings
+        if not self.cross_attn_encoder:
+            patch_embeds = self._create_patch_embeddings(h, boundaries, valid_patches, batch_size, max_patches, max_bytes)
         
-        for b in range(batch_size):
-            for p in range(max_patches):
-                if valid_patches[b, p]:
-                    start, end = boundaries[b, p]
-                    if start < end and end <= max_bytes:
-                        queries[b, p] = byte_hidden[b, start:end].mean(dim=0)
-        
-        # 4. Process patches one by one (simpler and more reliable)
-        patch_vecs = torch.zeros(batch_size, max_patches, self.config.h_encoder, device=bytes_tensor.device)
-        
-        for b in range(batch_size):
-            for p in range(max_patches):
-                if valid_patches[b, p]:
-                    start, end = boundaries[b, p]
-                    if start < end and end <= max_bytes:
-                        # Get bytes for this patch
-                        patch_bytes = byte_hidden[b:b+1, start:end]  # [1, patch_len, h_encoder]
-                        
-                        # Query: mean-pooled patch representation
-                        query = patch_bytes.mean(dim=1, keepdim=True)  # [1, 1, h_encoder]
-                        
-                        # Cross-attention: query attends to patch bytes
-                        patch_vec, _ = self.cross_attn(
-                            query=query,
-                            key=patch_bytes,
-                            value=patch_bytes
-                        )
-                        patch_vecs[b, p] = patch_vec.squeeze(1).squeeze(0)  # [h_encoder]
-        
-
-        
-        # 5. Project to main model dimension
-        patch_vecs_projected = self.patch_proj(patch_vecs)
+        # 4. Project to main model dimension
+        patch_vecs_projected = self.patch_proj(patch_embeds)
         
         if first_call:
             print(f"   Patch vectors shape: {patch_vecs_projected.shape}")
             print(f"   First patch vector norm: {patch_vecs_projected[0, 0].norm().item():.3f}")
         
-        return patch_vecs_projected, byte_hidden
+        return patch_vecs_projected, h
+    
+    def _create_patch_embeddings(self, h, boundaries, valid_patches, batch_size, max_patches, max_bytes):
+        """Create patch embeddings by pooling byte representations"""
+        patch_embeds = torch.zeros(batch_size, max_patches, self.config.h_encoder, device=h.device)
+        
+        for b in range(batch_size):
+            for p in range(max_patches):
+                if valid_patches[b, p]:
+                    start, end = boundaries[b, p]
+                    if start < end and end <= max_bytes:
+                        # Mean pooling over the patch
+                        patch_embeds[b, p] = h[b, start:end].mean(dim=0)
+        
+        return patch_embeds
 
 class LocalDecoder(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
+        self.cross_attn_decoder = config.cross_attn_decoder
+        self.cross_attn_all_layers_decoder = config.cross_attn_all_layers_decoder
+        
+        # Normalization
+        self.norm = nn.RMSNorm(config.h_decoder, eps=config.norm_eps)
         
         # Cross-attention layers
-        self.cross_attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(
-                config.h_decoder, 
-                num_heads=max(1, config.h_decoder // 64), 
-                batch_first=True
-            )
-            for _ in range(config.n_decoder_layers)
-        ])
+        if self.cross_attn_decoder:
+            layers_to_add = config.n_decoder_layers if self.cross_attn_all_layers_decoder else 1
+            self.cross_attn_layers = nn.ModuleList([
+                CrossAttention(
+                    dim=config.h_decoder,
+                    head_dim=config.h_decoder // config.cross_attn_nheads,
+                    n_heads=config.cross_attn_nheads,
+                    n_kv_heads=config.cross_attn_nheads,
+                    norm_eps=config.norm_eps
+                )
+                for _ in range(layers_to_add)
+            ])
         
         # Transformer layers for bytes
-        self.byte_transformer_layers = nn.ModuleList([
+        self.layers = nn.ModuleList([
             TransformerBlock(
                 config.h_decoder, 
                 max(1, config.h_decoder // 64),
@@ -427,61 +490,68 @@ class LocalDecoder(nn.Module):
         self.byte_proj = nn.Linear(config.h_encoder, config.h_decoder)
         
         # Output projection to byte vocabulary
-        self.output_proj = nn.Linear(config.h_decoder, config.vocab_size)
+        self.output = nn.Linear(config.h_decoder, config.vocab_size, bias=False)
         
     def forward(self, patch_vecs, byte_hidden_from_encoder, boundaries, valid_patches, first_call=False):
         batch_size = patch_vecs.size(0)
         max_bytes = byte_hidden_from_encoder.size(1)
-        max_patches = boundaries.size(1)
         
         if first_call:
             print(f"🔧 Decoder input: patch_vecs shape {patch_vecs.shape}")
             print(f"   Byte hidden shape: {byte_hidden_from_encoder.shape}")
         
-        # Project patch vectors and byte hidden to decoder dimension
-        patch_vecs_dec = self.patch_proj(patch_vecs)
-        byte_reprs = self.byte_proj(byte_hidden_from_encoder)
+        # Project inputs to decoder dimension
+        patch_embeds = self.patch_proj(patch_vecs)
+        h = self.byte_proj(byte_hidden_from_encoder)
         
-        # Create byte-to-patch mapping
-        byte_to_patch = torch.zeros(batch_size, max_bytes, dtype=torch.long, device=patch_vecs.device)
+        # Add patch embeddings if not using cross-attention
+        if not self.cross_attn_decoder:
+            # Map patch embeddings to byte positions
+            h = h + self._map_patches_to_bytes(patch_embeds, boundaries, valid_patches, batch_size, max_bytes)
         
-        for b in range(batch_size):
-            for p in range(max_patches):
-                if valid_patches[b, p]:
-                    start, end = boundaries[b, p]
-                    if start < end and end <= max_bytes:
-                        byte_to_patch[b, start:end] = p
+        # Apply dropout
+        h = F.dropout(h, p=self.config.dropout, training=self.training)
         
         # Apply decoder layers
-        for i, (cross_attn, transformer) in enumerate(zip(self.cross_attn_layers, self.byte_transformer_layers)):
-            # Get patch vectors for each byte position
-            patch_vecs_for_bytes = torch.gather(
-                patch_vecs_dec, 
-                dim=1, 
-                index=byte_to_patch.unsqueeze(-1).expand(-1, -1, self.config.h_decoder)
-            )
+        for i, layer in enumerate(self.layers):
+            # Apply cross-attention if enabled
+            if self.cross_attn_decoder and (i == 0 or self.cross_attn_all_layers_decoder):
+                layer_idx = i if self.cross_attn_all_layers_decoder else 0
+                h_cross = self.cross_attn_layers[layer_idx](
+                    x=h,
+                    kv=patch_embeds
+                )
+                h = h + h_cross
             
-            # Batched cross-attention
-            enhanced_bytes, _ = cross_attn(
-                query=byte_reprs,
-                key=patch_vecs_for_bytes,
-                value=patch_vecs_for_bytes
-            )
-            
-            # Residual connection and transformer
-            byte_reprs = enhanced_bytes + byte_reprs
-            byte_reprs = transformer(byte_reprs)
+            # Apply transformer layer
+            h = layer(h)
             
             if first_call and i == 0:
-                print(f"   After decoder layer {i}: {byte_reprs.shape}")
+                print(f"   After decoder layer {i}: {h.shape}")
         
-        # Project to byte vocabulary
-        logits = self.output_proj(byte_reprs)
+        # Final normalization and projection
+        h_preds = self.norm(h)
+        h_preds = F.dropout(h_preds, p=self.config.dropout, training=self.training)
+        logits = self.output(h_preds)
         
         if first_call:
             print(f"   Final logits shape: {logits.shape}")
         
-        return logits
+        return logits.float()
+    
+    def _map_patches_to_bytes(self, patch_embeds, boundaries, valid_patches, batch_size, max_bytes):
+        """Map patch embeddings to byte positions"""
+        byte_patch_embeds = torch.zeros(batch_size, max_bytes, self.config.h_decoder, device=patch_embeds.device)
+        
+        for b in range(batch_size):
+            for p in range(patch_embeds.size(1)):
+                if valid_patches[b, p]:
+                    start, end = boundaries[b, p]
+                    if start < end and end <= max_bytes:
+                        # Broadcast patch embedding to all bytes in the patch
+                        byte_patch_embeds[b, start:end] = patch_embeds[b, p]
+        
+        return byte_patch_embeds
 
 class BLT_LLM(nn.Module):
     def __init__(self, config: ModelConfig):

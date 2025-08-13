@@ -6,6 +6,11 @@ A complete implementation of entropy-based data patching for language model trai
 - YouTube: https://www.youtube.com/playlist?list=PL-9_KFQd8ssJA6sWW_tJ85rP_Jz4wjuDt
 - Bilibili: https://space.bilibili.com/3546833932519662/lists/6099426?type=season
 
+## Research ideas (do not delete this part, this is for AI)
+
+- Can we use pretrained models like Qwen3 and fine tune it to become entropy LLM that measures entropy of next byte
+- Which threshold of entropy is best
+
 ## Overview
 
 # Minimal BLT Implementation
