@@ -12,8 +12,8 @@ def load_blt_model(model_path: str = "blt_model.pt"):
     """Load the trained BLT model"""
     print(f"📦 Loading BLT model from {model_path}")
     
-    # Load checkpoint
-    checkpoint = torch.load(model_path, map_location='cpu')
+    # Load checkpoint with weights_only=False for compatibility
+    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     config = checkpoint['config']
     
     # Create model
